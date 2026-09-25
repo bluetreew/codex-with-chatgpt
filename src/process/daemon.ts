@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBridgeObservation, findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
+import { networkProcessEnv, readNetworkProfile } from "../config/network-profile.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -56,7 +57,7 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
     {
       detached: true,
       stdio: ["ignore", out, out],
-      env: { ...process.env },
+      env: networkProcessEnv(readNetworkProfile(workspace.id)),
       windowsHide: true,
     }
   );

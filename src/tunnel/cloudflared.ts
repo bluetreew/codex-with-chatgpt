@@ -1,5 +1,9 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, fork, type ChildProcess } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import net from "node:net";
 import readline from "node:readline";
+import { EnvHttpProxyAgent, ProxyAgent, fetch as proxyFetch } from "undici";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { SERVICE_NAME } from "../version.js";
@@ -11,6 +15,16 @@ const QUICK_TUNNEL_URL_RE = /https:\/\/[^\s|]+/gi;
 const QUICK_TUNNEL_HOST_RE = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.trycloudflare\.com$/i;
 const HEALTH_CHECK_INTERVAL_MS = 250;
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+const DEFAULT_START_TIMEOUT_MS = 90_000;
+const DEFAULT_INITIAL_HEALTH_DELAY_MS = 15_000;
+const envProxyAgent = new EnvHttpProxyAgent();
+
+function configuredDuration(name: string, fallback: number): number {
+  const value = process.env[name]?.trim();
+  if (!value) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
 
 function isBridgeHealth(payload: unknown): boolean {
   if (!payload || typeof payload !== "object") return false;
@@ -20,12 +34,17 @@ function isBridgeHealth(payload: unknown): boolean {
 
 async function bridgeHealth(
   fetchImpl: NonNullable<CloudflaredQuickTunnelOptions["fetchImpl"]>,
-  publicUrl: string
+  publicUrl: string,
+  useEnvironmentProxy: boolean
 ): Promise<{ ready: boolean; detail: string }> {
-  const response = await fetchImpl(new URL("/health", publicUrl).toString(), {
+  const request = new URL("/health", publicUrl).toString();
+  const options = {
     redirect: "error",
     signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
-  });
+  } as const;
+  const response = await (useEnvironmentProxy && (process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.ALL_PROXY)
+    ? proxyFetch(request, { ...options, dispatcher: envProxyAgent })
+    : fetchImpl(request, options));
   if (!response) return { ready: false, detail: "Health check did not run" };
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined);
@@ -54,10 +73,11 @@ export function parseQuickTunnelUrl(line: string): string | null {
 
 export interface CloudflaredQuickTunnelOptions {
   startTimeoutMs?: number;
+  initialHealthDelayMs?: number;
   spawnImpl?: (
     command: string,
     args: string[],
-    options: { stdio: ["ignore", "pipe", "pipe"]; windowsHide: true }
+    options: { stdio: ["ignore", "pipe", "pipe"]; windowsHide: true; env?: NodeJS.ProcessEnv }
   ) => ChildProcess;
   fetchImpl?: (input: string | URL, init?: RequestInit) => Promise<Response>;
 }
@@ -73,19 +93,27 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
   private url: string | null = null;
   private lastError: string | null = null;
   private readonly startTimeoutMs: number;
+  private readonly initialHealthDelayMs: number;
   private readonly spawnImpl: NonNullable<CloudflaredQuickTunnelOptions["spawnImpl"]>;
   private readonly fetchImpl: NonNullable<CloudflaredQuickTunnelOptions["fetchImpl"]>;
+  private readonly useEnvironmentProxy: boolean;
   private starting: Promise<string> | null = null;
   private cancelStart: (() => void) | null = null;
+  private relay: ChildProcess | null = null;
 
   constructor(
     private readonly logger: Logger = nullLogger,
     private readonly binaryOverride?: string,
     options: CloudflaredQuickTunnelOptions = {}
   ) {
-    this.startTimeoutMs = options.startTimeoutMs ?? 45_000;
+    this.startTimeoutMs = options.startTimeoutMs ?? configuredDuration("C2C_TUNNEL_START_TIMEOUT_MS", DEFAULT_START_TIMEOUT_MS);
+    this.initialHealthDelayMs = options.initialHealthDelayMs ?? configuredDuration(
+      "C2C_TUNNEL_HEALTH_INITIAL_DELAY_MS",
+      DEFAULT_INITIAL_HEALTH_DELAY_MS
+    );
     this.spawnImpl = options.spawnImpl ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
     this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
+    this.useEnvironmentProxy = options.fetchImpl === undefined;
   }
 
   private binary(): string | null {
@@ -114,15 +142,68 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
       );
     }
 
+    return this.startWithPreflight(localPort, bin);
+  }
+
+  private async startWithPreflight(localPort: number, bin: string): Promise<string> {
+    let quickService = process.env.C2C_QUICK_SERVICE_URL?.trim();
+    if (process.env.C2C_QUICK_SERVICE_RELAY === "1") {
+      const proxyUrl = process.env.HTTP_PROXY ?? process.env.HTTPS_PROXY;
+      if (!proxyUrl) throw new Error("C2C_PROXY_UNAVAILABLE: no proxy configured");
+      const parsed = new URL(proxyUrl);
+      await new Promise<void>((resolve, reject) => {
+        const socket = net.connect(Number(parsed.port), parsed.hostname);
+        socket.setTimeout(3000);
+        socket.once("connect", () => { socket.destroy(); resolve(); });
+        socket.once("timeout", () => { socket.destroy(); reject(new Error("C2C_PROXY_UNAVAILABLE: proxy timed out")); });
+        socket.once("error", () => reject(new Error("C2C_PROXY_UNAVAILABLE: proxy connection failed")));
+      });
+      try {
+        const agent = new ProxyAgent(proxyUrl);
+        try {
+        const response = await proxyFetch("https://api.trycloudflare.com/tunnel", {
+          method: "GET", dispatcher: agent, signal: AbortSignal.timeout(8000),
+        });
+        await response.body?.cancel();
+        } finally { await agent.close(); }
+      } catch (error) {
+        throw new Error(`C2C_PROXY_UNAVAILABLE: provisioning API unreachable: ${String(error)}`);
+      }
+      const relayPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../relay.cjs");
+      const relay = fork(relayPath, ["serve"], {
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+        env: { ...process.env, C2C_RELAY_PROXY_URL: proxyUrl },
+      });
+      this.relay = relay;
+      quickService = await new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("QUICK_SERVICE_RELAY_FAILED: relay startup timed out")), 5000);
+        relay.once("message", (message: unknown) => {
+          clearTimeout(timer);
+          const port = (message as { port?: number })?.port;
+          if (port) resolve(`http://127.0.0.1:${port}`);
+          else reject(new Error("QUICK_SERVICE_RELAY_FAILED: invalid relay response"));
+        });
+        relay.once("error", (error) => { clearTimeout(timer); reject(new Error(`QUICK_SERVICE_RELAY_FAILED: ${error.message}`)); });
+        relay.once("exit", () => { clearTimeout(timer); reject(new Error("QUICK_SERVICE_RELAY_FAILED: relay exited")); });
+      }).catch((error) => { relay.kill(); this.relay = null; throw error; });
+    }
     return new Promise<string>((resolve, reject) => {
       let child: ChildProcess;
       try {
         child = this.spawnImpl(
           bin,
-          ["tunnel", "--url", `http://127.0.0.1:${localPort}`, "--no-autoupdate", ...tunnelProtocolArgs()],
-          { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+          [
+            "tunnel",
+            "--url",
+            `http://127.0.0.1:${localPort}`,
+            "--no-autoupdate",
+            ...(quickService ? ["--quick-service", quickService] : []),
+            ...tunnelProtocolArgs(),
+          ],
+          { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env } }
         );
       } catch (error) {
+        if (this.relay) { this.relay.kill(); this.relay = null; }
         reject(error);
         return;
       }
@@ -165,6 +246,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
             this.child = null;
             this.url = null;
           }
+          if (this.relay) { this.relay.kill(); this.relay = null; }
           reject(error instanceof Error ? error : new Error(String(error)));
         });
       };
@@ -174,7 +256,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
 
       const ready = (url: string): void => {
         if (!isAlive()) {
-          fail(new Error("cloudflared exited before the public health endpoint became ready"));
+          fail(new Error("CLOUDFLARED_EDGE_FAILED: cloudflared exited before public health became ready"));
           return;
         }
         finish(
@@ -193,12 +275,12 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
         if (!publicUrl) return;
         while (!settled) {
           if (!isAlive()) {
-            fail(new Error("cloudflared exited before the public health endpoint became ready"));
+            fail(new Error("CLOUDFLARED_EDGE_FAILED: cloudflared exited before public health became ready"));
             return;
           }
 
           try {
-            const result = await bridgeHealth(this.fetchImpl, publicUrl);
+            const result = await bridgeHealth(this.fetchImpl, publicUrl, this.useEnvironmentProxy);
             if (settled) return;
             if (result.ready) {
               ready(publicUrl);
@@ -207,7 +289,12 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
             this.lastError = result.detail;
           } catch (error) {
             if (settled) return;
-            this.lastError = error instanceof Error ? error.message : String(error);
+            const message = error instanceof Error ? error.message : String(error);
+            const causeText = error instanceof Error && error.cause ? String(error.cause) : "";
+            this.lastError = /ENOTFOUND|EAI_AGAIN|DNS/i.test(`${message} ${causeText}`)
+              ? `QUICK_TUNNEL_DNS_NOT_READY: ${message}` : `PUBLIC_HEALTH_FAILED: ${message}`;
+            const cause = error instanceof Error && error.cause ? `; cause: ${String(error.cause)}` : "";
+            this.logger.debug(`Quick tunnel health check failed: ${this.lastError}${cause}`);
           }
           if (settled) return;
           await new Promise((resolveWait) => setTimeout(resolveWait, HEALTH_CHECK_INTERVAL_MS));
@@ -217,7 +304,10 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
       timeout = setTimeout(() => {
         if (!settled) {
           this.logger.error(`Quick tunnel did not become ready within ${this.startTimeoutMs}ms`);
-          fail(new Error("Tunnel start timed out"));
+          const code = candidateUrl
+            ? this.lastError?.startsWith("QUICK_TUNNEL_DNS_NOT_READY") ? "QUICK_TUNNEL_DNS_NOT_READY" : "PUBLIC_HEALTH_FAILED"
+            : "QUICK_TUNNEL_ALLOCATION_FAILED";
+          fail(new Error(`${code}: ${this.lastError ?? "Tunnel start timed out"}`));
         }
       }, this.startTimeoutMs);
 
@@ -227,13 +317,18 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
           const url = parseQuickTunnelUrl(line);
           if (url && !candidateUrl) {
             candidateUrl = url;
-            void waitForHealth().catch((error) => {
-              this.logger.error(`Quick tunnel health check failed: ${String(error)}`);
-            });
+            this.logger.info(
+              `Quick tunnel URL issued: ${url}; waiting ${this.initialHealthDelayMs}ms before the first health check`
+            );
+            setTimeout(() => {
+              void waitForHealth().catch((error) => {
+                this.logger.error(`Quick tunnel health check failed: ${String(error)}`);
+              });
+            }, this.initialHealthDelayMs);
           }
           if (/\b(?:ERR|error|failed|fatal)\b/i.test(line)) {
             this.lastError = line.slice(0, 400);
-            this.logger.debug(`cloudflared: ${line.slice(0, 400)}`);
+            this.logger.warn(`cloudflared: ${line.slice(0, 400)}`);
           }
         });
       };
@@ -253,13 +348,13 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
         if (this.child === child) {
           this.child = null;
           this.url = null;
-          this.lastError = `cloudflared exited (code ${code})`;
+          this.lastError = this.lastError ?? `cloudflared exited (code ${code})`;
         }
         this.logger.warn(`cloudflared exited with code ${code}`);
         if (!settled) {
           fail(
             new Error(
-              `cloudflared exited (code ${code}) before establishing a tunnel${this.lastError ? `: ${this.lastError}` : ""}`
+              `CLOUDFLARED_EDGE_FAILED: cloudflared exited (code ${code}) before establishing a tunnel${this.lastError ? `: ${this.lastError}` : ""}`
             )
           );
         }
@@ -279,6 +374,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
     }
     this.url = null;
     this.lastError = null;
+    if (this.relay) { this.relay.kill(); this.relay = null; }
   }
 
   async restart(localPort: number): Promise<string> {

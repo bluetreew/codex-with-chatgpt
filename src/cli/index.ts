@@ -26,6 +26,8 @@ import {
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir } from "../config/paths.js";
+import { readNetworkProfile, writeNetworkProfile } from "../config/network-profile.js";
+import { ProxyAgent, fetch as proxyFetch } from "undici";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
@@ -33,6 +35,8 @@ import {
   CHATGPT_DEVELOPER_MODE_URL,
   CHATGPT_PLUGINS_URL,
   connectorAction,
+  confirmedConnectorUrl,
+  confirmConnector,
   connectorNameFor,
   mcpUrlFromPublic,
   normalizePublicUrl,
@@ -132,6 +136,10 @@ function persistWorkspaceEndpoint(opts: {
     publicUrl: opts.publicUrl,
     mcpUrl: opts.mcpUrl,
     connectorName,
+    connectorConfirmedMcpUrl: confirmedConnectorUrl(previous),
+    connectorNeedsUpdate: Boolean(previous?.connectorNeedsUpdate) || Boolean(
+      previous?.mcpUrl && normalizePublicUrl(previous.mcpUrl) !== normalizePublicUrl(opts.mcpUrl)
+    ),
   });
   return connectorName;
 }
@@ -197,8 +205,10 @@ async function ensureBridgeAndTunnel(
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
   if (opts.tunnel && !info.publicUrl) {
-    const binaries = detectTunnelBinaries();
-    if (!binaries.cloudflared) {
+    const profile = readNetworkProfile(info.workspaceId);
+    const binary = profile?.cloudflaredPath && fs.existsSync(profile.cloudflaredPath)
+      ? profile.cloudflaredPath : detectTunnelBinaries().cloudflared;
+    if (!binary) {
       throw new Error(
         "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
       );
@@ -216,6 +226,55 @@ program
   .description(`${PRODUCT_NAME} — ChatGPT thinks. Codex works.`)
   .version(VERSION, "-v, --version")
   .configureHelp({ sortSubcommands: true });
+
+program.command("network")
+  .description("Manage a workspace-local C2C network profile")
+  .requiredOption("-w, --workspace <path>")
+  .option("--proxy-url <url>")
+  .option("--cloudflared-path <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace: string; proxyUrl?: string; cloudflaredPath?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      if (opts.proxyUrl || opts.cloudflaredPath) {
+        if (!opts.proxyUrl || !opts.cloudflaredPath) throw new Error("Both --proxy-url and --cloudflared-path are required");
+        const profile = {
+          proxyUrl: opts.proxyUrl,
+          cloudflaredPath: path.resolve(opts.cloudflaredPath),
+          tunnelProtocol: "http2" as const,
+          quickServiceRelay: true,
+          noProxy: "localhost,127.0.0.1,::1",
+        };
+        if (!fs.existsSync(profile.cloudflaredPath)) throw new Error("cloudflared path does not exist");
+        const proxy = new URL(profile.proxyUrl);
+        if (!["http:", "https:"].includes(proxy.protocol) || !proxy.hostname || !proxy.port || proxy.username || proxy.password) {
+          throw new Error("Proxy URL must be an HTTP(S) loopback endpoint without credentials");
+        }
+        if (!["127.0.0.1", "localhost", "[::1]"].includes(proxy.hostname)) {
+          throw new Error("Proxy URL must use a loopback host");
+        }
+        writeNetworkProfile(workspace.id, profile);
+        await stopBridge(workspace.root);
+      }
+      const profile = readNetworkProfile(workspace.id);
+      if (opts.json) say(JSON.stringify({ ok: true, configured: Boolean(profile), profile }));
+      else say(profile ? "C2C network profile is configured." : "No C2C network profile configured.");
+    } catch (error) { handleCliError(error, opts.json); }
+  });
+
+program.command("connector-confirm")
+  .description("Record that the current ChatGPT connector has been created and authorized")
+  .requiredOption("-w, --workspace <path>")
+  .requiredOption("--mcp-url <url>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace: string; mcpUrl: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const endpoint = confirmConnector(workspace.id, opts.mcpUrl);
+      if (opts.json) say(JSON.stringify({ ok: true, connectorName: endpoint.connectorName, mcpUrl: endpoint.mcpUrl }));
+      else check("ChatGPT connector configuration recorded");
+    } catch (error) { handleCliError(error, opts.json); }
+  });
 
 /** Machine-wide commands ignore `-w` so a Skill that always passes it cannot crash them. */
 function acceptUnusedWorkspaceOption(command: Command): Command {
@@ -255,7 +314,9 @@ program
   .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const workspace = new Workspace(root);
+      const resumeTunnel = opts.tunnel || Boolean(readLastEndpoint(workspace.id)?.publicUrl);
+      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: resumeTunnel });
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -366,10 +427,12 @@ program
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
+    const workspace = new Workspace(root);
+    const resumeTunnel = opts.tunnel || Boolean(readLastEndpoint(workspace.id)?.publicUrl);
     await stopBridge(root);
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: resumeTunnel });
       check(`Bridge 已重启（${info.workspaceName}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
@@ -455,9 +518,12 @@ program
 
     // Workspace
     let workspace: Workspace | null = null;
+    let networkProfile: ReturnType<typeof readNetworkProfile> = null;
     try {
       workspace = new Workspace(root);
       report.workspace = { ok: true, detail: workspace.name };
+      networkProfile = readNetworkProfile(workspace.id);
+      if (networkProfile) report.network = { ok: true, detail: "C2C-local profile loaded" };
     } catch (error) {
       report.workspace = { ok: false, detail: (error as Error).message };
     }
@@ -560,8 +626,18 @@ program
       let healthy = false;
       if (currentUrl) {
         try {
-          const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
-          healthy = response.ok;
+          if (networkProfile) {
+            const agent = new ProxyAgent(networkProfile.proxyUrl);
+            try {
+              const response = await proxyFetch(`${currentUrl}/health`, { dispatcher: agent, signal: AbortSignal.timeout(8000) });
+              healthy = response.ok;
+              await response.body?.cancel();
+            } finally { await agent.close(); }
+          } else {
+            const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
+            healthy = response.ok;
+            await response.body?.cancel();
+          }
         } catch {
           healthy = false;
         }
@@ -569,8 +645,9 @@ program
 
       if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running)) {
         try {
-          const binaries = detectTunnelBinaries();
-          if (!binaries.cloudflared) {
+          const binary = networkProfile?.cloudflaredPath && fs.existsSync(networkProfile.cloudflaredPath)
+            ? networkProfile.cloudflaredPath : detectTunnelBinaries().cloudflared;
+          if (!binary) {
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
             const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
@@ -592,7 +669,8 @@ program
       if (currentUrl && healthy) {
         report.tunnel = { ok: true, detail: currentUrl };
         const nextMcp = mcpUrlFromPublic(currentUrl);
-        const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
+        const action = lastEndpoint?.connectorNeedsUpdate
+          ? "update" : connectorAction(confirmedConnectorUrl(lastEndpoint), nextMcp);
         const boundName = nextMcp
           ? persistWorkspaceEndpoint({
               workspaceId: info.workspaceId,
@@ -605,13 +683,14 @@ program
           : connectorName;
         chatgptRepair = {
           ...chatgptRepair,
-          needed: action === "update",
-          reason: action === "update" ? "address_reclaimed" : undefined,
+          needed: action !== "none",
+          reason: action === "update" ? "address_reclaimed" : action === "create" ? "connector_not_configured" : undefined,
           connectorAction: action,
           connectorName: boundName,
-          userMessage: action === "update" ? reclaimUserMessage(boundName) : undefined,
+          userMessage: action === "update" ? reclaimUserMessage(boundName)
+            : action === "create" ? `请为当前项目添加「${boundName}」连接。` : undefined,
           mcpUrl: nextMcp,
-          previousMcpUrl: lastEndpoint?.mcpUrl ?? null,
+          previousMcpUrl: confirmedConnectorUrl(lastEndpoint),
         };
         if (action === "update") {
           results.push(`安全连接地址已更换，需要更新「${boundName}」`);
@@ -623,11 +702,10 @@ program
         report.tunnel = report.tunnel ?? { ok: false, detail: "安全连接未恢复" };
         chatgptRepair = {
           ...chatgptRepair,
-          needed: true,
-          reason: "address_reclaimed",
-          connectorAction: "update",
+          needed: false,
+          reason: "tunnel_unavailable",
+          connectorAction: "none",
           connectorName,
-          userMessage: reclaimUserMessage(connectorName),
           mcpUrl: null,
         };
       } else if (!currentUrl) {
@@ -644,11 +722,11 @@ program
       report.tunnel = { ok: false, detail: "安全连接未运行" };
       chatgptRepair = {
         ...chatgptRepair,
-        needed: true,
-        reason: "address_reclaimed",
-        connectorAction: "update",
+        needed: false,
+        reason: "tunnel_unavailable",
+        connectorAction: "none",
         connectorName,
-        userMessage: reclaimUserMessage(connectorName),
+        mcpUrl: null,
       };
     }
 
@@ -666,6 +744,7 @@ program
       mcp: "MCP",
       oauth: "OAuth",
       tunnel: "Tunnel",
+      network: "Network",
     };
     let allOk = true;
     for (const [key, value] of Object.entries(report)) {

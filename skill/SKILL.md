@@ -100,13 +100,31 @@ whatever data it needs by itself.
 
 ## In-app browser (ChatGPT)
 
+### Browser bootstrap compatibility
+
+For a coding or analysis task, never display a `[C2C]` INIT/EXECUTED message
+and ask the user to relay it, and never ask the user to paste a ChatGPT
+PLAN/DONE reply back into Codex. That is not a supported fallback. Confirm that
+the control message is visible in the ChatGPT tab before writing a
+`waitingFor: GPT_*` checkpoint.
+
+On some Codex desktop sessions, a fresh `node_repl` does not expose
+`setupBrowserRuntime` or `agent` as globals. That alone is not a failure.
+Before controlling ChatGPT, discover the active bundled Browser plugin and
+import its own `scripts/browser-client.mjs`; do not hardcode a plugin version.
+Call the module's `setupBrowserRuntime({ globals: globalThis })`, retain its
+returned agent, and then require `agent.browsers.list()` to expose an `iab`
+backend. An official bootstrap failure or a missing `iab` backend is the
+failure condition. Do not use CUA/Computer Use as a fallback.
+
 Official skill: `control-in-app-browser`. These C2C rules override defaults
 that close the tab, hide the window, or stall on the settings page.
 
-1. **Surface.** Once per Codex session: `setupBrowserRuntime()`, then
-   `const iab = await agent.browsers.get("iab")`. Reuse `iab`. Do not re-read
-   `documentation()` if it is already bound. Never `getDefault()`, `getForUrl()`,
-   or Computer Use.
+1. **Surface.** Once per Codex session: bootstrap the active bundled Browser
+   plugin's `scripts/browser-client.mjs` as described above, then use the
+   returned agent to call `agent.browsers.get("iab")`. Reuse `iab`. Do not
+   re-read `documentation()` if it is already bound. Never `getDefault()`,
+   `getForUrl()`, or Computer Use.
 
 2. **One tab.** Create the ChatGPT tab once (`tabs.new()`). After that, only
    `tab.goto(...)` to switch URLs. If the tab still exists, claim it — never
@@ -178,6 +196,36 @@ that close the tab, hide the window, or stall on the settings page.
    tab and never resend INIT/EXECUTED just because a wait timed out.
 
 ## Locations
+
+### C2C-local network profile
+
+If the workspace has a network profile in C2C's OS state directory, the CLI
+automatically loads it for `setup`, `start`, `restart`, and `doctor`. Do not set
+proxy variables in the Codex shell or Windows User/System environment. Do not
+ask the user to repeat proxy parameters after a restart. Inspect the profile
+with `c2c network -w <workspace> --json`; if absent on this machine, configure
+it once with `c2c network -w <workspace> --proxy-url <local HTTP proxy> --cloudflared-path <absolute executable path> --json`.
+The profile applies only to C2C child processes and public tunnel checks.
+Treat `C2C_PROXY_UNAVAILABLE`, `QUICK_SERVICE_RELAY_FAILED`,
+`QUICK_TUNNEL_ALLOCATION_FAILED`, `QUICK_TUNNEL_DNS_NOT_READY`,
+`CLOUDFLARED_EDGE_FAILED`, and `PUBLIC_HEALTH_FAILED` as distinct diagnostics.
+Only update the ChatGPT connector after `doctor` has a new public `mcpUrl` and
+`chatgptRepair.needed` is true.
+After the replacement is Connected and paired, run
+`c2c connector-confirm -w <workspace> --mcp-url <new mcpUrl> --json`.
+This records the address actually configured in ChatGPT; do not mark it
+confirmed before the Connector is connected. Then run `doctor` again.
+
+### Canonical C2C state directory (this machine)
+
+Use `D:\app_home\codex-with-chatgpt-state` as the C2C state root. Every C2C
+CLI command on this machine — including `setup`, `start`, `restart`, `doctor`,
+`network`, `session`, `pair`, `logs`, and `stop` — must run with
+`C2C_STATE_DIR=D:\app_home\codex-with-chatgpt-state`. Prefer the inherited
+User-level variable. If the calling Codex process does not inherit it, inject
+this one C2C-specific variable into the command process explicitly. Do not use
+`%LOCALAPPDATA%\codex-with-chatgpt` or Codex Package LocalCache as a fallback,
+and do not set any Windows global proxy variables.
 
 - The codex-with-chatgpt checkout lives at: `<ACTUAL_CHECKOUT_PATH>`
   (installer/update MUST replace this line in the installed Skill with the user's actual checkout path.)
@@ -300,6 +348,8 @@ Speak only of 临时地址 / 固定域名 / 登录 Cloudflare.
      Only then run `c2c pair --json` and type that code. As soon as it shows
      Connected / authorized / pairing accepted, continue — do NOT wait for 8
      tools on this page.
+     Run `c2c connector-confirm -w <workspace> --mcp-url <mcpUrl> --json`
+     after Connected / pairing, then `c2c doctor -w <workspace> --json`.
 6. Same tab: open the first C2C chat per **Conversation management**
    (Project collection for a new workspace; `https://chatgpt.com/` only
    in long-chat). Confirm Chat mode per **In-app browser** §7 (if it is Work,
@@ -363,7 +413,9 @@ next action:
 4. Ask them to Connect / Authorize. Then run `c2c pair --json` and give them
    only that pairing code. If it expires before they finish, run pair again.
 5. When they report Connected / authorized / pairing accepted, resume the normal
-   setup/reconnect flow at its ChatGPT verification step. If automatic browser
+   setup/reconnect flow at its ChatGPT verification step. First run
+   `c2c connector-confirm -w <workspace> --mcp-url <mcpUrl> --json`, then
+   `c2c doctor -w <workspace> --json`. If automatic browser
    verification then hits the same explicit failure twice, stop and report the
    exact failed step; do not loop indefinitely and do not continue without C2C.
 
@@ -683,7 +735,9 @@ the previous public address is gone. Doctor already started a new one.
      code. Continue as soon as it is Connected — do not wait for 8 tools on
      the settings page.
    - If the name is already gone, skip Delete and only create.
-4. `c2c doctor --json` again. Same tab: only after the Doctor gate is green,
+4. After Connected / pairing, run `c2c connector-confirm -w <workspace>
+   --mcp-url <chatgptRepair.mcpUrl> --json`, then `c2c doctor --json` again.
+   Same tab: only after the Doctor gate is green,
    reopen the chat this Codex thread was already using (`session.url` /
    the URL you saved earlier in THIS thread). Do not rewrite Project
    instructions — they store the connector **name**, which did not change.

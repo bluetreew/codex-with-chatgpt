@@ -1,12 +1,33 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import {
   connectorAction,
+  confirmedConnectorUrl,
+  confirmConnector,
   connectorNameFor,
   DEFAULT_CONNECTOR_NAME,
   mcpUrlFromPublic,
   normalizePublicUrl,
   reclaimUserMessage,
+  writeLastEndpoint,
+  readLastEndpoint,
 } from "../src/config/endpoint.js";
+import { cleanup, isolateStateDir } from "./helpers.js";
+
+const stateDirs: string[] = [];
+afterEach(() => { while (stateDirs.length) cleanup(stateDirs.pop()!); });
+
+describe("connector confirmation", () => {
+  it("keeps a pending update across repeated doctor runs until the new URL is confirmed", () => {
+    stateDirs.push(isolateStateDir());
+    const previous = writeLastEndpoint({ workspaceId: "mozi", port: 48765, publicUrl: "https://old.trycloudflare.com", mcpUrl: "https://old.trycloudflare.com/mcp" });
+    expect(confirmedConnectorUrl(previous)).toBe(previous.mcpUrl);
+    writeLastEndpoint({ workspaceId: "mozi", port: 48765, publicUrl: "https://new.trycloudflare.com", mcpUrl: "https://new.trycloudflare.com/mcp", connectorConfirmedMcpUrl: confirmedConnectorUrl(previous) });
+    expect(connectorAction(confirmedConnectorUrl(readLastEndpoint("mozi")), readLastEndpoint("mozi")?.mcpUrl)).toBe("update");
+    expect(() => confirmConnector("mozi", "https://wrong.trycloudflare.com/mcp")).toThrow();
+    confirmConnector("mozi", "https://new.trycloudflare.com/mcp");
+    expect(connectorAction(confirmedConnectorUrl(readLastEndpoint("mozi")), readLastEndpoint("mozi")?.mcpUrl)).toBe("none");
+  });
+});
 
 describe("connectorAction", () => {
   it("creates on the first successful URL", () => {

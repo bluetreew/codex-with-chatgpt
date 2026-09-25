@@ -41,13 +41,14 @@ class FakeCloudflaredProcess extends EventEmitter {
   });
 }
 
-function setupTunnel(fetchImpl: FetchImpl, startTimeoutMs = 1_000) {
+function setupTunnel(fetchImpl: FetchImpl, startTimeoutMs = 1_000, initialHealthDelayMs = 0) {
   const child = new FakeCloudflaredProcess();
   const spawnImpl = vi.fn(() => child as unknown as ChildProcess);
   const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
     spawnImpl,
     fetchImpl,
     startTimeoutMs,
+    initialHealthDelayMs,
   });
   return { child, spawnImpl, tunnel };
 }
@@ -108,8 +109,8 @@ describe("CloudflaredQuickTunnel", () => {
     await expect(starting).resolves.toBe(QUICK_URL);
     expect(spawnImpl).toHaveBeenCalledWith(
       "cloudflared",
-      ["tunnel", "--url", "http://127.0.0.1:3333", "--no-autoupdate"],
-      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+      ["tunnel", "--url", "http://127.0.0.1:3333", "--no-autoupdate", ...tunnelProtocolArgs()],
+      expect.objectContaining({ stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: expect.any(Object) })
     );
     expect(fetchImpl).toHaveBeenCalledWith(`${QUICK_URL}/health`, {
       redirect: "error",
@@ -128,7 +129,7 @@ describe("CloudflaredQuickTunnel", () => {
     expect(spawnImpl).toHaveBeenCalledWith(
       "cloudflared",
       ["tunnel", "--url", "http://127.0.0.1:3333", "--no-autoupdate", "--protocol", "http2"],
-      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+      expect.objectContaining({ stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: expect.any(Object) })
     );
     await tunnel.stop();
     vi.unstubAllEnvs();
@@ -155,7 +156,7 @@ describe("CloudflaredQuickTunnel", () => {
     const starting = tunnel.start(3333);
     announceUrl(child);
 
-    await expect(starting).rejects.toThrow(/timed out/i);
+    await expect(starting).rejects.toThrow(/PUBLIC_HEALTH_FAILED/i);
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     expect(tunnel.status()).toMatchObject({ running: false, url: null });
   });
@@ -164,7 +165,7 @@ describe("CloudflaredQuickTunnel", () => {
     const { child, spawnImpl, tunnel } = setupTunnel(() => new Promise<Response>(() => {}));
     const starting = tunnel.start(3333);
     announceUrl(child);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     const concurrent = tunnel.start(3333);
     await tunnel.stop();
@@ -181,7 +182,7 @@ describe("CloudflaredQuickTunnel", () => {
     );
     const starting = tunnel.start(3333);
     announceUrl(child);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     child.exitCode = 1;
     child.emit("exit", 1, null);
