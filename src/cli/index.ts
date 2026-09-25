@@ -60,6 +60,7 @@ import {
 } from "../session/state.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
+import { formatArtifactSyncReceipt, materializeArtifact, parseArtifactBundle, validateArtifactTargets } from "../artifact-sync.js";
 
 const program = new Command();
 
@@ -969,6 +970,7 @@ session
       say(`模式：${conversation.mode === "project" ? "Project 合集" : "长对话"}`);
       if (conversation.projectUrl) say(`合集：${conversation.projectUrl}`);
       if (saved.title) say(`会话：${saved.title}`);
+      if (saved.workflowMode) say(`工作流：${saved.workflowMode}`);
       if (saved.url) say(`对话：${saved.url}`);
       if (saved.connectorName) say(`连接器：${saved.connectorName}`);
       if (saved.taskId) say(`任务：${saved.taskId}（第 ${saved.iteration ?? 0} 轮，${saved.lastState ?? "?"}）`);
@@ -990,6 +992,7 @@ session
   .option("--iteration <n>")
   .option("--state <state>", "last protocol state, e.g. EXECUTED")
   .option("--mode <mode>", "long-chat or project")
+  .option("--workflow-mode <mode>", "quick or design-first")
   .option("--project-url <url>", "ChatGPT Project collection URL (…/g/g-p-…/project)")
   .option("--connector-name <name>", "exact connector title for this workspace")
   .option("--protocol-state <state>", "checkpoint protocol state, e.g. EXECUTED_SENT")
@@ -1008,6 +1011,7 @@ session
       iteration?: string;
       state?: string;
       mode?: string;
+      workflowMode?: string;
       projectUrl?: string;
       connectorName?: string;
       protocolState?: string;
@@ -1022,6 +1026,10 @@ session
       const modeRaw = opts.mode?.trim().toLowerCase();
       if (modeRaw && modeRaw !== "long-chat" && modeRaw !== "project") {
         throw new Error("mode must be long-chat or project");
+      }
+      const workflowRaw = opts.workflowMode?.trim().toLowerCase();
+      if (workflowRaw && workflowRaw !== "quick" && workflowRaw !== "design-first") {
+        throw new Error("workflow-mode must be quick or design-first");
       }
       const protocolRaw = opts.protocolState?.trim().toUpperCase();
       if (protocolRaw && !PROTOCOL_STATES.includes(protocolRaw as ProtocolState)) {
@@ -1043,6 +1051,7 @@ session
         iteration: opts.iteration ? parseInt(opts.iteration, 10) : undefined,
         lastState: opts.state,
         conversationMode: modeRaw as ConversationMode | undefined,
+        workflowMode: workflowRaw as "quick" | "design-first" | undefined,
         projectUrl: opts.projectUrl,
         connectorName: opts.connectorName,
         clearCheckpoint: opts.clearCheckpoint,
@@ -1076,6 +1085,56 @@ session
     if (!result.cleared) say("尚未记录 ChatGPT 会话。");
     else if (result.keptProject) check("已清除当前对话，合集绑定仍保留");
     else check("已清除会话记录，下次任务将新建 ChatGPT 会话");
+  });
+
+program
+  .command("artifact-sync")
+  .description("Safely materialize a declared Markdown Artifact Sync bundle")
+  .option("-w, --workspace <path>")
+  .requiredOption("--bundle-file <path>", "local UTF-8 file containing the Artifact Sync envelope")
+  .option("--json", "machine-readable receipt", false)
+  .action((opts: { workspace?: string; bundleFile: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const bundleText = fs.readFileSync(path.resolve(opts.bundleFile), "utf8");
+    const bundle = parseArtifactBundle(bundleText);
+    const saved: ReturnType<typeof materializeArtifact>[] = [];
+    let activeArtifact: (typeof bundle.artifacts)[number] | undefined;
+    try {
+      for (const artifact of bundle.artifacts) {
+        activeArtifact = artifact;
+        validateArtifactTargets(workspace.root, [artifact]);
+      }
+      for (const artifact of bundle.artifacts) {
+        activeArtifact = artifact;
+        saved.push(materializeArtifact(workspace.root, artifact));
+      }
+    } catch (error) {
+      const failure = {
+        bundleId: bundle.bundleId,
+        status: "FAILED",
+        saved,
+        failedArtifactId: activeArtifact?.id,
+        failedTargetPath: activeArtifact?.targetPath,
+        error: error instanceof Error ? error.message : String(error),
+        noImplementationPerformed: true,
+      };
+      if (opts.json) say(JSON.stringify(failure));
+      else say(`[ARTIFACT_SYNC_RECEIPT]\nBUNDLE_ID: ${bundle.bundleId}\nSTATUS: FAILED\nSAVED_COUNT: ${saved.length}\nFAILED_TARGET: ${activeArtifact?.targetPath ?? "bundle validation"}\nNO_IMPLEMENTATION_PERFORMED: true`);
+      process.exitCode = 1;
+      return;
+    }
+    const receipt = {
+      bundleId: bundle.bundleId,
+      afterSync: bundle.afterSync,
+      status: "SUCCESS",
+      saved,
+      receiptText: formatArtifactSyncReceipt(bundle.bundleId, saved),
+      noImplementationPerformed: true,
+    };
+    if (opts.json) say(JSON.stringify(receipt));
+    else {
+      say(formatArtifactSyncReceipt(bundle.bundleId, saved));
+    }
   });
 
 const prefsCmd = program

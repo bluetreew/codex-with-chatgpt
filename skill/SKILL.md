@@ -428,7 +428,20 @@ later say they want a Project, run **Bind Project**. A brand-new workspace
 (no session file) is **project**.
 
 Never match a Project or a chat by display name. Never upload the repo to
-Project sources. Never click 分享 / Share. Do not rename ChatGPT chats.
+Project sources. Never click 分享 / Share. Chat titles are display metadata,
+never identity. A title may be renamed only after workspace verification and
+the chat URL has been saved; rename is best-effort and must not change the
+saved URL binding.
+
+**Identity and rename rule**
+
+- The saved ChatGPT chat URL is the sole conversation identity.
+- Never search, recover, bind, or verify a chat by its title.
+- A rename is optional UX. If a direct rename control is available in the
+  current Chat page, use the user's title or a short goal-based title. Do not
+  hunt menus. After rename, read the address bar and require it to equal the
+  saved URL. If it differs, stop rename handling and keep the original mapping;
+  never recover by title. A rename failure does not fail setup.
 
 ### long-chat (do not rewrite this path)
 
@@ -558,6 +571,103 @@ brief, re-read code through the connector, and resume at NEXT_EXPECTED_STEP.
 Be substantive: why, which file, what to test. No empty one-liners and
 no 40-step epics. Use C2C control messages.
 ```
+
+## Workflow selection: Quick vs Design-first
+
+`conversation.mode` (`project` / `long-chat`) controls conversation
+organization only. `workflowMode` (`quick` / `design-first`) is independent.
+Never add a third conversation mode or a `STATE: DESIGN` protocol state.
+When no workflow is stored or named, preserve the existing Quick behavior.
+Persist an explicit choice with `c2c session set --workflow-mode quick|design-first`.
+
+Recognize these separate intents:
+
+- **Quick**: "使用 C2C 快速模式完成 XXX" or the existing "使用 Codex with
+  ChatGPT 实现 XXX". Run the existing `INIT → PLAN → EXECUTION → EXECUTED →
+  REVIEW → DONE` loop. Do not add Artifact Sync.
+- **Design-first**: "使用 C2C 设计模式讨论 XXX". Prepare the verified ChatGPT
+  conversation and stop for Human ↔ ChatGPT discussion. Do not send INIT, set
+  a `waitingFor` checkpoint, implement code, or turn discussion into a task.
+- **Sync**: "同步当前 ChatGPT 的阶段成果和 LOG SYNC，不开发". Run only the
+  Artifact Sync Loop below, then stop.
+- **Implement**: "设计完成，进入实施" (or equally explicit authorization).
+  Only this user intent opens the Implementation Authorization Gate below.
+
+### Design-first setup
+
+1. Run the normal local doctor/health gate. Read the saved workspace,
+   connector, and conversation using `c2c session --json`; do not alter
+   `conversation.mode`.
+2. For Project mode, open the saved Project collection and create a new Chat
+   from its on-page composer. For long-chat, preserve its one-chat-per-workspace
+   reuse rule. In the same IAB tab, confirm Chat mode, send the boot prompt,
+   then call `workspace_info` with the exact connector name.
+3. Verify that `workspace_info` names the current workspace. Save the Chat URL
+   only after verification, with `--workflow-mode design-first`. A title may
+   be renamed under **Identity and rename rule** above.
+4. Stop. Tell the user: "设计讨论会话已准备好，请在 ChatGPT 中继续讨论。"
+   Do not send INIT, create a task checkpoint, or execute design ideas.
+
+### Artifact Sync Loop (Markdown only)
+
+Artifact Sync is separate from the C2C coding protocol. A synchronized
+Artifact never authorizes implementation. Only accept a plain-text
+`[ARTIFACT_SYNC_BUNDLE]` envelope containing `.md` `document` or `log-sync`
+artifacts with explicit `create` / `replace` modes. Do not interpret prose as
+an implicit write request. Keep each Markdown body byte-for-byte as received;
+never summarize, edit, format, translate, append, or repair it.
+
+**Transport:** File-first requires a reliable IAB download/attachment-bytes
+API. The current documented IAB runtime does not expose one, so File-first is
+not supported here. Do not claim a file was downloaded or use GUI Save As,
+browser cache scraping, or system download hacks. Use Text fallback: copy the
+complete machine-readable envelope unchanged into a temporary local text file,
+then run `c2c artifact-sync -w <workspace> --bundle-file <temp-file> --json`.
+The helper parses the envelope, permits only declared Markdown destinations
+inside the canonical workspace, uses atomic writes, re-reads each result, and
+returns a ready-to-send receipt with size and SHA256. Review the receipt; a
+parser or write error is `FAILED`, never partial success. The helper does not
+run code or delete files.
+
+Path rules are enforced by the helper: no absolute paths, `..`, symlink or
+junction traversal, `.git`, `.env*`, credential/secret paths, non-Markdown
+extensions, undeclared targets, or deletion. `create` fails if the target
+exists. `replace` replaces only its explicitly declared existing `.md` target.
+No other file may be touched. Do not run package installation, build, tests,
+refactors, or commits as part of a sync.
+
+After successful local verification, send the helper's `receiptText` to the
+**same saved Chat URL** (not as a C2C protocol message). Its format is:
+
+```text
+[ARTIFACT_SYNC_RECEIPT]
+BUNDLE_ID: <bundle id>
+STATUS: SUCCESS
+SAVED:
+- ARTIFACT_ID: <id>
+  PATH: <path>
+  SIZE: <bytes>
+  SHA256: <digest>
+NO_IMPLEMENTATION_PERFORMED: true
+NEXT_ACTION:
+Verify the synchronized files through the workspace connector.
+Continue design discussion unless the user explicitly authorizes implementation.
+```
+
+Ask ChatGPT to use the existing read-only connector `read_file` tool for every
+saved path and confirm readability and content match. Do not add connector
+write tools or broaden OAuth scopes. After read-back, return control to Human
+↔ ChatGPT and stop. Never send `STATE: EXECUTED`, start a PLAN, or implement.
+
+### Implementation Authorization Gate
+
+Only the user's explicit "设计完成，进入实施" or equivalent authorizes
+implementation. Open the same saved Chat URL and send the existing standard
+`[C2C] STATE: INIT` in the normal format. State that the plan must use the
+confirmed design from this Chat and synchronized workspace Markdown, preserve
+frozen decisions, re-check current workspace state through the connector, and
+produce a standard PLAN. Then resume the existing coding workflow. Artifact
+Sync completion alone never crosses this gate.
 
 ## Workflow: coding task（"使用 Codex with ChatGPT 完成 XXX"）
 

@@ -93,6 +93,27 @@ describe("mergeSession", () => {
     expect(next.taskId).toBe("c2c_ab12");
   });
 
+  it("persists workflowMode independently from conversationMode", () => {
+    const previous = mergeSession(null, {
+      conversationMode: "project",
+      projectUrl: PROJECT,
+      url: "https://chatgpt.com/c/stable-id",
+      workflowMode: "design-first",
+    });
+    expect(previous.conversationMode).toBe("project");
+    expect(previous.workflowMode).toBe("design-first");
+    expect(mergeSession(previous, { workflowMode: "quick" }).conversationMode).toBe("project");
+    expect(mergeSession(previous, { workflowMode: "quick" }).workflowMode).toBe("quick");
+  });
+
+  it("keeps chat URL identity stable when display title changes", () => {
+    const url = "https://chatgpt.com/c/stable-id";
+    const first = mergeSession(null, { url, title: "Design draft", workflowMode: "design-first" });
+    const renamed = mergeSession(first, { title: "MOZI · Architecture design" });
+    expect(renamed.url).toBe(url);
+    expect(renamed.title).toBe("MOZI · Architecture design");
+  });
+
   it("writes and clears a checkpoint without dropping the chat URL", () => {
     const withCheckpoint = mergeSession(
       {
@@ -202,6 +223,7 @@ describe("clearChatPointer", () => {
       projectUrl: PROJECT,
       url: "https://chatgpt.com/c/gone",
       connectorName: "Codex with ChatGPT · Demo",
+      workflowMode: "design-first",
       checkpoint: {
         taskId: "c2c_ab12",
         iteration: 4,
@@ -216,6 +238,7 @@ describe("clearChatPointer", () => {
     const saved = readSession("abc123abc123");
     expect(saved?.projectUrl).toBe(PROJECT);
     expect(saved?.url).toBeUndefined();
+    expect(saved?.workflowMode).toBe("design-first");
     expect(saved?.checkpoint?.protocolState).toBe("EXECUTED_SENT");
   });
 

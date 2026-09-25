@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 
 export type ConversationMode = "long-chat" | "project";
+export type WorkflowMode = "quick" | "design-first";
 
 export type ConversationReason = "existing-long-chat" | "project" | "new-workspace";
 
@@ -53,6 +54,7 @@ export interface SavedSession {
   conversationMode?: ConversationMode;
   projectUrl?: string;
   connectorName?: string;
+  workflowMode?: WorkflowMode;
   checkpoint?: TaskCheckpoint;
 }
 
@@ -65,6 +67,7 @@ export interface SessionPatch {
   conversationMode?: ConversationMode;
   projectUrl?: string;
   connectorName?: string;
+  workflowMode?: WorkflowMode;
   checkpoint?: Partial<TaskCheckpoint> & { protocolState?: ProtocolState };
   clearCheckpoint?: boolean;
 }
@@ -259,6 +262,7 @@ export function mergeSession(previous: SavedSession | null, patch: SessionPatch)
     conversationMode: conversationMode === "project" && projectUrl ? "project" : conversationMode,
     projectUrl,
     connectorName: patch.connectorName ?? previous?.connectorName,
+    workflowMode: patch.workflowMode ?? previous?.workflowMode,
     checkpoint,
     savedAt: new Date().toISOString(),
   };
@@ -274,6 +278,7 @@ export function clearChatPointer(workspaceId: string): { cleared: boolean; keptP
       conversationMode: "project",
       projectUrl: view.projectUrl,
       connectorName: previous.connectorName,
+      workflowMode: previous.workflowMode,
       checkpoint: previous.checkpoint,
       savedAt: new Date().toISOString(),
     });
