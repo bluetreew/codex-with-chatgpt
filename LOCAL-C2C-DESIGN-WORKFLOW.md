@@ -71,3 +71,5 @@ and synchronized documents, and then follows the unchanged Quick coding loop.
   interpret arbitrary attachments, or perform implementation.
 - Connector access remains read-only. No write-file, shell, git, or OAuth
   permission is added to ChatGPT.
+
+Accepted baseline: [C2C Design Workflow v1 — FROZEN](docs/C2C-Design-Workflow-v1-FROZEN.md).
