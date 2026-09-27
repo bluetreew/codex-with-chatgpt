@@ -30,6 +30,9 @@ whatever data it needs by itself.
 4. If something fails, run `c2c doctor` and repair silently. Only involve the user
    for logins, CAPTCHA, 2FA, explicit consent screens, or **guided manual
    ChatGPT setup** below — and then give them ONE action.
+   **C2C CHECK exception:** `C2C CHECK` is read-only. It never repairs,
+   restarts, re-pairs, recreates a Connector, or changes session/project state;
+   report the failed layer and recovery action instead.
    Before the first ChatGPT connection on this machine, `c2c prefs --json`:
    - `setupMode` missing: tell the user exactly `setupChoicePrompt`, wait for
      「1」or「2」, then `c2c prefs set --setup-mode auto|manual --json`.
@@ -246,6 +249,9 @@ and do not set any Windows global proxy variables.
 
 At the START of every workflow below (before anything else), run these two
 commands (both are cheap / cached; never mention them unless an update exists):
+
+Exception: `C2C CHECK` skips this maintenance step so the health check remains
+read-only. It runs only the read-only commands listed in its workflow below.
 
 1. `c2c update-check --json` (do not pass `-w`)
 2. `c2c sandbox-allow --json` (do not pass `-w`) — writes the C2C state directory into Codex's
@@ -582,6 +588,9 @@ Persist an explicit choice with `c2c session set --workflow-mode quick|design-fi
 
 Recognize these separate intents:
 
+- **Check**: `C2C CHECK`, `检查 C2C 连接`, `测试 C2C 连接`, or `检查 Codex 与
+  ChatGPT 通信`. Run only the read-only **C2C CHECK** workflow below. It does
+  not start or resume a coding task.
 - **Quick**: "使用 C2C 快速模式完成 XXX" or the existing "使用 Codex with
   ChatGPT 实现 XXX". Run the existing `INIT → PLAN → EXECUTION → EXECUTED →
   REVIEW → DONE` loop. Do not add Artifact Sync.
@@ -592,6 +601,78 @@ Recognize these separate intents:
   Artifact Sync Loop below, then stop.
 - **Implement**: "设计完成，进入实施" (or equally explicit authorization).
   Only this user intent opens the Implementation Authorization Gate below.
+
+### C2C CHECK — read-only end-to-end connection check
+
+Use this after Codex/computer/network recovery or when the user asks `C2C CHECK`.
+The check verifies the existing route and does not repair it.
+
+1. Run these read-only commands in order and capture their results:
+
+   ```text
+   c2c doctor -w <workspace> --no-fix --json
+   c2c session -w <workspace> --json
+   c2c workspace -w <workspace> --json
+   ```
+
+   Require the local doctor checks for state/sandbox, workspace, Bridge, MCP,
+   OAuth, and Tunnel to pass; require `chatgptRepair.needed` and
+   `namedRepair.needed` to be false. Require the session to contain its saved
+   Chat URL and exact Connector name. The workspace result supplies the local
+   `name` and `workspaceId` for comparison with `workspace_info`.
+2. If any local requirement fails, stop before opening ChatGPT and report
+   `C2C CHECK: RECOVERY_REQUIRED`, the failed layer and reason, and the next
+   recovery action. Do not run repair or maintenance commands.
+3. Bootstrap/reuse the built-in IAB as described in **In-app browser
+   (ChatGPT)**. Open only the saved session Chat URL; reuse its tab when already
+   there. Do not search by title, create a Chat, or change its title. Require
+   `currentChatUrl == savedChatUrl` before sending anything.
+4. Generate a short unique CHECK_ID and send this ordinary message to that
+   Chat, replacing the placeholders with the captured values:
+
+   ```text
+   [C2C CHECK]
+   CHECK_ID: <short unique id>
+
+   Use only the configured connector "<connectorName>".
+   Call workspace_info and reply exactly:
+   CHECK_OK: <CHECK_ID>
+   WORKSPACE_NAME: <workspaceName>
+   WORKSPACE_ID: <workspaceId>
+
+   Do not send or request INIT, PLAN, EXECUTED, or REVIEW. Do not modify files.
+   ```
+
+   `[C2C CHECK]` is not a protocol state. Do not create or update a task
+   checkpoint or set `waitingFor`.
+5. Wait in the same Chat and automatically read the reply. On a browser timeout,
+   inspect the same tab before deciding what to do; never resend while it may
+   still be generating. Require the CHECK_ID, workspace name, and workspace ID
+   to match the local results. A mismatch is `C2C CHECK: FAIL`, layer
+   `WORKSPACE_IDENTITY`; stop and report the binding error.
+6. Read `c2c session --json` again. Require these values to be unchanged:
+   `taskId`, `iteration`, `lastState`, `checkpoint` (including protocol state
+   and waiting target), `workflowMode`, Project URL, saved Chat URL, and
+   Connector name. A changed value is `C2C CHECK: FAIL`, layer
+   `SESSION_INTEGRITY`.
+7. On success, report:
+
+   ```text
+   C2C CHECK: PASS
+   ✓ Local bridge
+   ✓ Secure connection
+   ✓ Saved Chat binding
+   ✓ ChatGPT Connector and workspace identity
+   ✓ Codex → ChatGPT → Codex round trip
+   Workspace: <workspaceName>
+   Connector: <connectorName>
+   Mode: <workflowMode or unset>
+   ```
+
+   On failure, report `C2C CHECK: FAIL` or `C2C CHECK: RECOVERY_REQUIRED`,
+   plus `Failed layer`, `Reason`, and `Recommended next action`. On a Chat URL
+   mismatch, use layer `CHAT_BINDING`. Never repair or rebind as part of this
+   check.
 
 ### Design-first setup
 
