@@ -40,7 +40,7 @@ export function confirmedConnectorUrl(endpoint: LastEndpoint | null): string | n
     ? endpoint.mcpUrl : endpoint.connectorConfirmedMcpUrl;
 }
 
-export function confirmConnector(workspaceId: string, mcpUrl: string): LastEndpoint {
+export function confirmConnector(workspaceId: string, mcpUrl: string, connectorName?: string | null): LastEndpoint {
   const previous = readLastEndpoint(workspaceId);
   if (!previous?.mcpUrl || normalizePublicUrl(previous.mcpUrl) !== normalizePublicUrl(mcpUrl)) {
     throw new Error("Connector URL does not match the current C2C endpoint");
@@ -50,7 +50,7 @@ export function confirmConnector(workspaceId: string, mcpUrl: string): LastEndpo
     port: previous.port,
     publicUrl: previous.publicUrl,
     mcpUrl: previous.mcpUrl,
-    connectorName: previous.connectorName,
+    connectorName: connectorName?.trim() || previous.connectorName,
     connectorConfirmedMcpUrl: previous.mcpUrl,
     connectorNeedsUpdate: false,
   });

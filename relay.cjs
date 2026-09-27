@@ -1,7 +1,10 @@
 const http = require("node:http");
 const { fetch, ProxyAgent } = require("undici");
 
-if (process.argv.includes("serve")) {
+if (process.argv.includes("recovery-probe")) {
+  if (!process.send) process.exit(2);
+  process.send({ type: "c2c-recovery-probe-ready" }, () => process.exit(0));
+} else if (process.argv.includes("serve")) {
   const proxy = new ProxyAgent(process.env.C2C_RELAY_PROXY_URL || "http://127.0.0.1:10809");
   const server = http.createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/tunnel") {

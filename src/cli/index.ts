@@ -25,8 +25,8 @@ import {
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
-import { getStateDir } from "../config/paths.js";
-import { readNetworkProfile, writeNetworkProfile } from "../config/network-profile.js";
+import { getStateDir, readJsonIfExists } from "../config/paths.js";
+import { networkProfileFile, readNetworkProfile, writeNetworkProfile } from "../config/network-profile.js";
 import { ProxyAgent, fetch as proxyFetch } from "undici";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
@@ -61,6 +61,9 @@ import {
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { formatArtifactSyncReceipt, materializeArtifact, parseArtifactBundle, validateArtifactTargets } from "../artifact-sync.js";
+import { planRecovery, type RecoveryFacts } from "../recovery/harness.js";
+import { probeExecutionContext } from "../recovery/probe.js";
+import { readRecoveryProgress, writeRecoveryProgress } from "../recovery/state.js";
 
 const program = new Command();
 
@@ -271,7 +274,7 @@ program.command("connector-confirm")
   .action((opts: { workspace: string; mcpUrl: string; json: boolean }) => {
     try {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const endpoint = confirmConnector(workspace.id, opts.mcpUrl);
+      const endpoint = confirmConnector(workspace.id, opts.mcpUrl, readSession(workspace.id)?.connectorName);
       if (opts.json) say(JSON.stringify({ ok: true, connectorName: endpoint.connectorName, mcpUrl: endpoint.mcpUrl }));
       else check("ChatGPT connector configuration recorded");
     } catch (error) { handleCliError(error, opts.json); }
@@ -778,6 +781,169 @@ program
             : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
     );
     if (!allOk || namedRepair.needed) process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------- deterministic recovery helpers (internal)
+
+program
+  .command("recovery-probe", { hidden: true })
+  .description("Probe child-process capability locally and inside an existing Bridge")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspace.id));
+      const cloudflaredPath = profile?.cloudflaredPath;
+      const localProbe = await probeExecutionContext({ context: "local", cloudflaredPath });
+      const observation = await findBridgeObservation(workspace.id);
+      let bridgeProbe: Awaited<ReturnType<typeof probeExecutionContext>> | null = null;
+      let bridgeProbeError = false;
+      if (observation.state === "healthy") {
+        try {
+          const response = await adminFetch<{ ok: boolean; probe: Awaited<ReturnType<typeof probeExecutionContext>> }>(
+            observation.runtime,
+            "GET",
+            "/admin/recovery-probe",
+            12_000
+          );
+          bridgeProbe = response.probe;
+        } catch {
+          bridgeProbeError = true;
+        }
+      }
+      const payload = {
+        ok: true,
+        state: "RECOVERY_PROBE",
+        bridgeStatus: observation.state,
+        bridgeReason: observation.state === "unknown" ? observation.reason : undefined,
+        localProbe,
+        bridgeProbe,
+        bridgeProbeError,
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else say(JSON.stringify(payload, null, 2));
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+program
+  .command("recovery-plan", { hidden: true })
+  .description("Return the next deterministic emergency-recovery state/action")
+  .requiredOption("--facts-base64 <value>")
+  .requiredOption("--workspace <path>")
+  .option("--new-run", "reset the workspace-local recovery run state", false)
+  .option("--authorize-restart", "consume the single restricted-Bridge restart attempt", false)
+  .option("--json", "machine-readable output", false)
+  .action((opts: { factsBase64: string; workspace: string; newRun: boolean; authorizeRestart: boolean; json: boolean }) => {
+    try {
+      if (!opts.workspace.trim()) throw new Error("--workspace must be a non-empty path");
+      const facts = JSON.parse(Buffer.from(opts.factsBase64, "base64").toString("utf8")) as RecoveryFacts;
+      if (opts.newRun && facts.transitionEvent) throw new Error("--new-run cannot be combined with a recovery transition event");
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const workspaceId = workspace.id;
+      let progress = null;
+      if (opts.newRun) {
+        progress = { state: "LOCAL_DIAGNOSIS" as const, capableContextAttempted: false, bridgeRestartAttempted: false, sessionSnapshot: facts.session ?? null };
+        writeRecoveryProgress(workspaceId, progress);
+      } else {
+        progress = readRecoveryProgress(workspaceId);
+      }
+
+      let result;
+      const terminalStates = new Set(["COMPLETE", "BLOCKED_LOCAL_EXECUTION", "BLOCKED_STATE_INCONSISTENT", "BLOCKED_BRIDGE_UNKNOWN", "LOCAL_RECOVERY_FAILED", "UNAPPROVED_CLOUDFLARED_PATH", "INVALID_RECOVERY_TRANSITION"]);
+      if (!opts.newRun && facts.transitionEvent && progress && terminalStates.has(progress.state)) {
+        result = {
+          ok: false,
+          state: "INVALID_RECOVERY_TRANSITION" as const,
+          nextAction: "INVALID_RECOVERY_TRANSITION" as const,
+          humanActionRequired: false,
+          facts: { currentState: progress.state, event: facts.transitionEvent },
+        };
+      } else if (!opts.newRun && progress && terminalStates.has(progress.state)) {
+        result = {
+          ok: progress.state === "COMPLETE",
+          state: progress.state,
+          nextAction: progress.state,
+          humanActionRequired: false,
+          facts: { reason: "recovery run is already terminal; begin a new run explicitly to continue" },
+        };
+      } else if (!opts.newRun && !progress) {
+        result = {
+          ok: false,
+          state: facts.transitionEvent ? "INVALID_RECOVERY_TRANSITION" as const : "BLOCKED_STATE_INCONSISTENT" as const,
+          nextAction: facts.transitionEvent ? "INVALID_RECOVERY_TRANSITION" as const : "BLOCKED_STATE_INCONSISTENT" as const,
+          humanActionRequired: false,
+          facts: { reason: "no active recovery run state; begin with c2c-status.ps1 -StartNewRecovery" },
+        };
+      } else if (facts.transitionEvent && (!progress || facts.recoveryState !== progress.state)) {
+        result = {
+          ok: false,
+          state: "INVALID_RECOVERY_TRANSITION" as const,
+          nextAction: "INVALID_RECOVERY_TRANSITION" as const,
+          humanActionRequired: false,
+          facts: { currentState: progress?.state ?? null, suppliedState: facts.recoveryState ?? null, event: facts.transitionEvent },
+        };
+      } else {
+        if (progress) {
+          if (!facts.transitionEvent) facts.recoveryState = progress.state;
+          if (facts.transitionEvent === "CONNECTOR_CONFIRM_REQUESTED" || facts.transitionEvent === "CONNECTOR_CONFIRMED") {
+            if (!progress.pairedConnectorName || facts.actualConnectorName !== progress.pairedConnectorName) {
+              result = {
+                ok: false,
+                state: "INVALID_RECOVERY_TRANSITION" as const,
+                nextAction: "INVALID_RECOVERY_TRANSITION" as const,
+                humanActionRequired: false,
+                facts: { pairedConnectorName: progress.pairedConnectorName ?? null, actualConnectorName: facts.actualConnectorName ?? null },
+              };
+            }
+          }
+          facts.capableContextAttempted = progress.capableContextAttempted;
+          facts.bridgeRestartAttempted = progress.bridgeRestartAttempted;
+          if (facts.phase === "POST_RECOVERY_VERIFY") {
+            const currentConnectorName = facts.sessionAfter?.connectorName?.trim();
+            if (!progress.pairedConnectorName || currentConnectorName !== progress.pairedConnectorName.trim()) {
+              result = {
+                ok: false,
+                state: "BLOCKED_STATE_INCONSISTENT" as const,
+                nextAction: "BLOCKED_STATE_INCONSISTENT" as const,
+                humanActionRequired: false,
+                facts: { reason: "current Connector differs from the Connector confirmed during pairing", pairedConnectorName: progress.pairedConnectorName ?? null, currentConnectorName: currentConnectorName ?? null },
+              };
+            } else if (!progress.sessionSnapshot) {
+              result = {
+                ok: false,
+                state: "BLOCKED_STATE_INCONSISTENT" as const,
+                nextAction: "BLOCKED_STATE_INCONSISTENT" as const,
+                humanActionRequired: false,
+                facts: { reason: "recovery run has no protected session baseline" },
+              };
+            } else {
+              facts.session = progress.sessionSnapshot;
+              if (!facts.actualConnectorName) facts.actualConnectorName = facts.sessionAfter?.connectorName;
+            }
+          }
+        }
+        if (!result) result = planRecovery(facts);
+      }
+      if (opts.authorizeRestart && result.nextAction === "RESTART_BRIDGE_IN_CAPABLE_CONTEXT" && progress) {
+        progress = { ...progress, state: result.state, bridgeRestartAttempted: true };
+      }
+      if ((opts.newRun || progress) && result.state !== "INVALID_RECOVERY_TRANSITION") {
+        writeRecoveryProgress(workspaceId, {
+          state: result.state,
+          capableContextAttempted: Boolean(progress?.capableContextAttempted || ("capableContextAttempted" in result.facts && result.facts.capableContextAttempted)),
+          bridgeRestartAttempted: Boolean(progress?.bridgeRestartAttempted),
+          sessionSnapshot: progress?.sessionSnapshot ?? facts.session ?? null,
+          pairedConnectorName: progress?.pairedConnectorName ?? (facts.transitionEvent === "PAIRING_COMPLETED" && result.state === "AI_CONFIRM_CONNECTOR" ? facts.actualConnectorName : undefined),
+        });
+      }
+      if (opts.json) say(JSON.stringify(result));
+      else say(JSON.stringify(result, null, 2));
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
   });
 
 // ---------------------------------------------------------------- pair / unpair

@@ -24,8 +24,9 @@ describe("connector confirmation", () => {
     writeLastEndpoint({ workspaceId: "mozi", port: 48765, publicUrl: "https://new.trycloudflare.com", mcpUrl: "https://new.trycloudflare.com/mcp", connectorConfirmedMcpUrl: confirmedConnectorUrl(previous) });
     expect(connectorAction(confirmedConnectorUrl(readLastEndpoint("mozi")), readLastEndpoint("mozi")?.mcpUrl)).toBe("update");
     expect(() => confirmConnector("mozi", "https://wrong.trycloudflare.com/mcp")).toThrow();
-    confirmConnector("mozi", "https://new.trycloudflare.com/mcp");
+    confirmConnector("mozi", "https://new.trycloudflare.com/mcp", "Codex with ChatGPT · MOZI · v4");
     expect(connectorAction(confirmedConnectorUrl(readLastEndpoint("mozi")), readLastEndpoint("mozi")?.mcpUrl)).toBe("none");
+    expect(readLastEndpoint("mozi")?.connectorName).toBe("Codex with ChatGPT · MOZI · v4");
   });
 });
 

@@ -16,6 +16,8 @@ import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { probeExecutionContext } from "../recovery/probe.js";
+import type { ExecutionProbe } from "../recovery/harness.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -40,6 +42,8 @@ export interface BridgeOptions {
   authStoreFile?: string;
   pairingTtlMs?: number;
   accessTokenTtlMs?: number;
+  /** Optional deterministic fixture for the local admin recovery probe. */
+  recoveryProbe?: () => Promise<ExecutionProbe>;
 }
 
 export interface Bridge {
@@ -172,6 +176,18 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       pid: process.pid,
       startedAt,
     });
+  });
+
+  app.get("/admin/recovery-probe", adminGuard, async (_req, res) => {
+    try {
+      const tunnelDoctor = await tunnel.doctor();
+      const probe = opts.recoveryProbe
+        ? await opts.recoveryProbe()
+        : await probeExecutionContext({ context: "bridge", cloudflaredPath: tunnelDoctor.binaryPath });
+      res.json({ ok: true, context: "bridge", probe });
+    } catch {
+      res.status(500).json({ ok: false, context: "bridge", error: "recovery_probe_failed" });
+    }
   });
 
   app.post("/admin/tunnel/start", adminGuard, (_req, res) => {
