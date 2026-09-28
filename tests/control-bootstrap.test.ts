@@ -3,11 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BridgeObservation, RuntimeState } from "../src/bridge/runtime.js";
+import { networkProfileFile } from "../src/config/network-profile.js";
 import {
   APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
+  createControlBootstrapCliAdapter,
   controlBootstrapRetryMarkerFile,
   createControlBootstrapRetryMarker,
   probeControlStateDirectoryWrite,
+  probeControlBootstrapLocalExecution,
+  resolveControlBootstrapCloudflared,
   readControlBootstrapProgress,
   runControlBootstrap,
   validateControlBootstrapIsolation,
@@ -17,7 +21,7 @@ import {
   type StateDirectoryWriteProbe,
 } from "../src/control-bootstrap.js";
 import type { ExecutionProbe } from "../src/recovery/harness.js";
-import type { BridgeProbeObservation } from "../src/recovery/probe.js";
+import { resolveApprovedCloudflaredPath, type BridgeProbeObservation, type ProbeAdapter } from "../src/recovery/probe.js";
 
 const roots: string[] = [];
 
@@ -109,6 +113,13 @@ function stoppedObservation(): BridgeObservation {
   return { state: "stopped", runtime: null, reason: "runtime_missing" };
 }
 
+function writeFixture(directory: string, name: string, contents: string): string {
+  const file = path.join(directory, name);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, contents);
+  return file;
+}
+
 function adapter(input: ControlBootstrapInput, overrides: {
   writeProbe?: StateDirectoryWriteProbe;
   localProbes?: ExecutionProbe[];
@@ -132,6 +143,40 @@ function adapter(input: ControlBootstrapInput, overrides: {
     bridgeProbe: vi.fn(async () => overrides.bridgeProbe ?? bridgeProbe()),
   };
   return value;
+}
+
+function cliWiredAdapter(
+  input: ControlBootstrapInput,
+  probeAdapter: ProbeAdapter,
+  environment: NodeJS.ProcessEnv,
+): ControlBootstrapAdapter {
+  const { localProbe: _unusedMock, ...dependencies } = adapter(input);
+  return createControlBootstrapCliAdapter(input.workspaceId, dependencies, { probeAdapter, environment });
+}
+
+async function withStateDirectory<T>(stateDir: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.C2C_STATE_DIR;
+  process.env.C2C_STATE_DIR = stateDir;
+  try { return await run(); }
+  finally {
+    if (previous === undefined) delete process.env.C2C_STATE_DIR;
+    else process.env.C2C_STATE_DIR = previous;
+  }
+}
+
+function cloudflaredProbeAdapter(approvedPath?: string, relayFork: "PASS" | "EPERM" = "EPERM") {
+  const spawned: string[] = [];
+  const adapter: ProbeAdapter = {
+    spawnVersion(executable) {
+      const resolved = path.resolve(executable);
+      spawned.push(resolved);
+      const allowed = [process.execPath, ...(approvedPath ? [approvedPath] : [])]
+        .map((value) => process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value));
+      return allowed.includes(process.platform === "win32" ? resolved.toLowerCase() : resolved) ? "PASS" : "FAIL";
+    },
+    async forkRelay() { return relayFork; },
+  };
+  return { adapter, spawned };
 }
 
 afterEach(() => {
@@ -377,5 +422,138 @@ describe("CONTROL bootstrap capable execution handoff", () => {
     const result = await runControlBootstrap(input, deps);
     expect(result).toMatchObject({ state: "CONTROL_BOOTSTRAP_BLOCKED", reason: "CONTROL_BRIDGE_STATE_UNKNOWN" });
     expect(deps.startBridge).not.toHaveBeenCalled();
+  });
+});
+
+describe("fresh-state CONTROL CLI cloudflared resolver wiring", () => {
+  it("discovers the trusted managed executable with no profile and reaches the single retry gate", async () => {
+    const { input } = fixture();
+    const managedDirectory = path.join(path.dirname(input.controlStateDir), "cloudflared");
+    fs.mkdirSync(managedDirectory, { recursive: true });
+    const executable = writeFixture(managedDirectory, "cloudflared.exe", "fixture executable");
+    const env = { ...process.env, C2C_CLOUDFLARED_PATH: "", PATH: managedDirectory };
+    const probe = cloudflaredProbeAdapter(fs.realpathSync(executable));
+
+    await withStateDirectory(input.controlStateDir, async () => {
+      const profileFile = networkProfileFile(input.workspaceId);
+      expect(fs.existsSync(profileFile)).toBe(false);
+      expect(resolveControlBootstrapCloudflared(undefined, env)).toMatchObject({
+        status: "PASS",
+        source: "managed",
+        candidate: fs.realpathSync(executable),
+      });
+      const deps = cliWiredAdapter(input, probe.adapter, env);
+      const result = await runControlBootstrap(input, deps);
+      expect(result).toMatchObject({
+        state: "CONTROL_CAPABLE_CONTEXT_REQUIRED",
+        nextAction: "RETRY_CAPABLE_CONTEXT",
+        localProbe: {
+          nodeChildSpawn: "PASS",
+          cloudflaredSpawn: "PASS",
+          relayFork: "EPERM",
+          classification: "RESTRICTED_EXECUTION_CONTEXT",
+        },
+      });
+      expect(probe.spawned).toContain(path.resolve(executable));
+      expect(fs.existsSync(profileFile)).toBe(false);
+      expect(deps.startBridge).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(["PATH", "C2C_CLOUDFLARED_PATH"] as const)(
+    "rejects an untrusted %s candidate without executing it or opening the retry gate",
+    async (source) => {
+      const { input } = fixture();
+      const untrustedDirectory = path.join(path.dirname(input.controlStateDir), "untrusted-bin");
+      fs.mkdirSync(untrustedDirectory, { recursive: true });
+      const untrustedExecutable = writeFixture(untrustedDirectory, "cloudflared.exe", "untrusted fixture");
+      const env = {
+        ...process.env,
+        C2C_CLOUDFLARED_PATH: source === "C2C_CLOUDFLARED_PATH" ? untrustedExecutable : "",
+        PATH: source === "PATH" ? untrustedDirectory : "",
+      };
+      const probe = cloudflaredProbeAdapter();
+
+      await withStateDirectory(input.controlStateDir, async () => {
+        expect(fs.existsSync(networkProfileFile(input.workspaceId))).toBe(false);
+        expect(resolveControlBootstrapCloudflared(undefined, env)).toMatchObject({
+          status: "NOT_CONFIGURED",
+          source: "none",
+        });
+        const deps = cliWiredAdapter(input, probe.adapter, env);
+        const result = await runControlBootstrap(input, deps);
+        expect(result).toMatchObject({
+          state: "CONTROL_BOOTSTRAP_BLOCKED",
+          nextAction: "CONTROL_BOOTSTRAP_BLOCKED",
+          localProbe: {
+            cloudflaredSpawn: "NOT_CONFIGURED",
+            relayFork: "EPERM",
+            classification: "CLOUDFLARED_UNAVAILABLE",
+          },
+        });
+        expect(probe.spawned).toEqual([path.resolve(process.execPath)]);
+        expect(probe.spawned).not.toContain(path.resolve(untrustedExecutable));
+        expect(deps.startBridge).not.toHaveBeenCalled();
+      });
+    },
+  );
+
+  it("uses a trusted profile candidate through the same approved validator", async () => {
+    const { input } = fixture();
+    const managedDirectory = path.join(path.dirname(input.controlStateDir), "cloudflared");
+    fs.mkdirSync(managedDirectory, { recursive: true });
+    const executable = writeFixture(managedDirectory, "cloudflared.exe", "fixture executable");
+    const env = { ...process.env, C2C_CLOUDFLARED_PATH: "", PATH: "" };
+    const probe = cloudflaredProbeAdapter(fs.realpathSync(executable), "PASS");
+
+    await withStateDirectory(input.controlStateDir, async () => {
+      const profileFile = networkProfileFile(input.workspaceId);
+      fs.mkdirSync(path.dirname(profileFile), { recursive: true });
+      fs.writeFileSync(profileFile, JSON.stringify({ cloudflaredPath: executable }));
+      const result = await probeControlBootstrapLocalExecution(input.workspaceId, {
+        environment: env,
+        probeAdapter: probe.adapter,
+      });
+      expect(result).toMatchObject({ cloudflaredSpawn: "PASS", classification: "CAPABLE" });
+      expect(probe.spawned).toContain(path.resolve(executable));
+    });
+  });
+
+  it.skipIf(!junctionFixtureSupported)("rejects a managed-root junction escape before executing cloudflared", async () => {
+    const { input } = fixture();
+    const parent = path.dirname(input.controlStateDir);
+    const managedDirectory = path.join(parent, "cloudflared");
+    const outsideDirectory = path.join(parent, "outside-cloudflared");
+    fs.mkdirSync(outsideDirectory, { recursive: true });
+    const outsideExecutable = writeFixture(outsideDirectory, "cloudflared.exe", "outside fixture");
+
+    const fileLinkManaged = path.join(parent, "cloudflared-file-link");
+    fs.mkdirSync(fileLinkManaged, { recursive: true });
+    let fileSymlinkSupported = false;
+    try {
+      fs.symlinkSync(outsideExecutable, path.join(fileLinkManaged, "cloudflared.exe"), "file");
+      fileSymlinkSupported = true;
+    } catch {
+      // Directory junction coverage below remains mandatory on Windows without file-symlink privilege.
+    }
+    if (fileSymlinkSupported) {
+      expect(resolveApprovedCloudflaredPath(undefined, fileLinkManaged).status).toBe("UNAPPROVED_CLOUDFLARED_PATH");
+    }
+
+    fs.symlinkSync(outsideDirectory, managedDirectory, "junction");
+    const env = { ...process.env, C2C_CLOUDFLARED_PATH: "", PATH: managedDirectory };
+    const probe = cloudflaredProbeAdapter();
+
+    await withStateDirectory(input.controlStateDir, async () => {
+      expect(resolveApprovedCloudflaredPath(undefined, managedDirectory).status).toBe("UNAPPROVED_CLOUDFLARED_PATH");
+      const deps = cliWiredAdapter(input, probe.adapter, env);
+      const result = await runControlBootstrap(input, deps);
+      expect(result.localProbe).toMatchObject({
+        cloudflaredSpawn: "UNAPPROVED_CLOUDFLARED_PATH",
+        classification: "UNAPPROVED_CLOUDFLARED_PATH",
+      });
+      expect(probe.spawned).toEqual([path.resolve(process.execPath)]);
+      expect(deps.startBridge).not.toHaveBeenCalled();
+    });
   });
 });

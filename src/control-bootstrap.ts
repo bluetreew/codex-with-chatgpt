@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { writeSecureJson } from "./config/paths.js";
+import { getStateDir, readJsonIfExists, writeSecureJson } from "./config/paths.js";
+import { networkProfileFile } from "./config/network-profile.js";
 import type { BridgeObservation, RuntimeState } from "./bridge/runtime.js";
-import type { ExecutionProbe } from "./recovery/harness.js";
-import type { BridgeProbeObservation } from "./recovery/probe.js";
+import { classifyProbe, type ExecutionProbe } from "./recovery/harness.js";
+import { probeExecutionContext, resolveApprovedCloudflaredPath, type BridgeProbeObservation, type ProbeAdapter } from "./recovery/probe.js";
+import { discoverBinaryCandidates } from "./tunnel/detect.js";
 
 export type ControlBootstrapState =
   | "CONTROL_CAPABLE_CONTEXT_REQUIRED"
@@ -73,6 +75,87 @@ export interface ControlBootstrapAdapter {
   findBridge(workspaceId: string): Promise<BridgeObservation>;
   startBridge(workspaceRoot: string): Promise<{ runtime: RuntimeState; spawned: boolean }>;
   bridgeProbe(runtime: RuntimeState, workspaceId: string): Promise<BridgeProbeObservation>;
+}
+
+export interface ControlBootstrapCloudflaredResolution {
+  candidate?: string;
+  managedDirectory: string;
+  status: "PASS" | "NOT_CONFIGURED" | "UNAPPROVED_CLOUDFLARED_PATH";
+  source: "profile" | "managed" | "discovery" | "none";
+}
+
+export interface ControlBootstrapProbeOptions {
+  environment?: NodeJS.ProcessEnv;
+  probeAdapter?: ProbeAdapter;
+}
+
+/** Discover candidates without executing them; only the existing managed-root validator can approve one. */
+export function resolveControlBootstrapCloudflared(
+  profileCandidate: unknown,
+  environment: NodeJS.ProcessEnv = process.env,
+): ControlBootstrapCloudflaredResolution {
+  const managedDirectory = path.join(path.dirname(getStateDir()), "cloudflared");
+  if (profileCandidate !== undefined && profileCandidate !== null && profileCandidate !== "") {
+    const approved = resolveApprovedCloudflaredPath(profileCandidate, managedDirectory);
+    return {
+      ...(approved.status === "PASS" ? { candidate: approved.path } : {}),
+      managedDirectory,
+      status: approved.status,
+      source: "profile",
+    };
+  }
+
+  const managed = resolveApprovedCloudflaredPath(undefined, managedDirectory);
+  if (managed.status === "PASS") {
+    return { candidate: managed.path, managedDirectory, status: "PASS", source: "managed" };
+  }
+  if (managed.status === "UNAPPROVED_CLOUDFLARED_PATH") {
+    return { managedDirectory, status: managed.status, source: "managed" };
+  }
+
+  for (const discovered of discoverBinaryCandidates("cloudflared", environment)) {
+    let isFile = false;
+    try { isFile = fs.statSync(discovered).isFile(); }
+    catch { /* An absent discovery candidate is not an installation. */ }
+    if (!isFile) continue;
+    const approved = resolveApprovedCloudflaredPath(discovered, managedDirectory);
+    if (approved.status === "PASS") {
+      return { candidate: approved.path, managedDirectory, status: "PASS", source: "discovery" };
+    }
+  }
+
+  // Untrusted PATH/environment candidates are intentionally not returned to the probe.
+  return { managedDirectory, status: "NOT_CONFIGURED", source: "none" };
+}
+
+/** Production CLI probe wiring: profile read → safe discovery → trust validation → execution probe. */
+export async function probeControlBootstrapLocalExecution(
+  workspaceId: string,
+  options: ControlBootstrapProbeOptions = {},
+): Promise<ExecutionProbe> {
+  const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspaceId));
+  const resolved = resolveControlBootstrapCloudflared(profile?.cloudflaredPath, options.environment ?? process.env);
+  const base = await probeExecutionContext({
+    context: "local",
+    cloudflaredPath: resolved.candidate,
+    managedCloudflaredDirectory: resolved.managedDirectory,
+    adapter: options.probeAdapter,
+  });
+  if (resolved.status !== "UNAPPROVED_CLOUDFLARED_PATH") return base;
+  const facts = { ...base, cloudflaredSpawn: "UNAPPROVED_CLOUDFLARED_PATH" as const };
+  return { ...facts, classification: classifyProbe("local", facts) };
+}
+
+/** Build the adapter used by both production CLI and fresh-state wiring tests. */
+export function createControlBootstrapCliAdapter(
+  workspaceId: string,
+  dependencies: Omit<ControlBootstrapAdapter, "localProbe">,
+  options: ControlBootstrapProbeOptions = {},
+): ControlBootstrapAdapter {
+  return {
+    ...dependencies,
+    localProbe: () => probeControlBootstrapLocalExecution(workspaceId, options),
+  };
 }
 
 const states: readonly ControlBootstrapState[] = [

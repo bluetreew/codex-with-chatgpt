@@ -72,6 +72,7 @@ import {
 } from "../recovery/state.js";
 import {
   APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
+  createControlBootstrapCliAdapter,
   probeControlStateDirectoryWrite,
   runControlBootstrap,
   validateControlBootstrapIsolation,
@@ -863,7 +864,6 @@ program
       }
 
       const workspace = new Workspace(controlRoot);
-      const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspace.id));
       const result = await runControlBootstrap({
         workspaceId: workspace.id,
         controlWorkspaceRoot: workspace.root,
@@ -871,10 +871,9 @@ program
         targetWorkspaceRoot: opts.targetWorkspace,
         targetStateDir: opts.targetStateDir,
         capableContextRetry: opts.capableContextRetry,
-      }, {
+      }, createControlBootstrapCliAdapter(workspace.id, {
         approvedIdentities: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
         stateDirectoryWriteProbe: probeControlStateDirectoryWrite,
-        localProbe: () => probeExecutionContext({ context: "local", cloudflaredPath: profile?.cloudflaredPath }),
         findBridge: (workspaceId) => findBridgeObservation(workspaceId),
         startBridge: (workspaceRoot) => ensureBridge(workspaceRoot),
         bridgeProbe: (runtime, workspaceId) => observeBridgeRecoveryProbe({
@@ -883,7 +882,7 @@ program
           workspaceId,
           timeoutMs: 12_000,
         }),
-      });
+      }));
       emit(result);
     } catch (error) {
       emit(blocked(error instanceof Error ? error.message : "CONTROL_BOOTSTRAP_FAILED"));

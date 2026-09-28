@@ -11,6 +11,31 @@ const COMMON_DIRS = [
   "C:\\Program Files (x86)\\cloudflared",
 ];
 
+/**
+ * Return deterministic candidate paths without executing any candidate.
+ * Callers that use this for a security-sensitive probe must validate each
+ * result against their own approved location before starting a process.
+ */
+export function discoverBinaryCandidates(name: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  const exe = process.platform === "win32" ? `${name}.exe` : name;
+  const candidates: string[] = [];
+  if (name === "cloudflared" && env.C2C_CLOUDFLARED_PATH?.trim()) {
+    candidates.push(env.C2C_CLOUDFLARED_PATH.trim());
+  }
+  for (const directory of (env.PATH ?? "").split(path.delimiter)) {
+    const cleaned = directory.trim().replace(/^"(.*)"$/, "$1");
+    if (cleaned) candidates.push(path.join(cleaned, exe));
+  }
+  for (const directory of COMMON_DIRS) candidates.push(path.join(directory, exe));
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    const key = process.platform === "win32" ? path.resolve(candidate).toLowerCase() : path.resolve(candidate);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function accessibleFile(candidate: string): string | null {
   try {
     const resolved = path.resolve(candidate);

@@ -166,18 +166,30 @@ export function resolveApprovedCloudflaredPath(
   managedDirectory = path.join(path.dirname(getStateDir()), "cloudflared")
 ): { status: "PASS"; path: string } | { status: "NOT_CONFIGURED" | "UNAPPROVED_CLOUDFLARED_PATH" } {
   try {
-    const managedRoot = fs.realpathSync(managedDirectory);
+    const requestedManagedRoot = path.resolve(managedDirectory);
+    const managedRoot = fs.realpathSync.native(requestedManagedRoot);
+    const comparePath = (value: string): string => {
+      const normalized = path.resolve(value).replace(/^\\\\\\?\\/, "");
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    // The approved root itself must not be redirected through a symlink or junction.
+    if (comparePath(managedRoot) !== comparePath(requestedManagedRoot)) {
+      return { status: "UNAPPROVED_CLOUDFLARED_PATH" };
+    }
     const canonicalPath = path.join(managedRoot, "cloudflared.exe");
-    const canonical = fs.realpathSync(canonicalPath);
-    if (!fs.statSync(canonical).isFile() || path.basename(canonical).toLowerCase() !== "cloudflared.exe") {
+    const canonical = fs.realpathSync.native(canonicalPath);
+    // The managed executable entry itself must also be a regular canonical file,
+    // not a symlink/junction whose target escapes the approved root.
+    if (comparePath(canonical) !== comparePath(canonicalPath) ||
+        !fs.statSync(canonical).isFile() || path.basename(canonical).toLowerCase() !== "cloudflared.exe") {
       return { status: "UNAPPROVED_CLOUDFLARED_PATH" };
     }
     const configured = candidate === undefined || candidate === null || candidate === "" ? canonicalPath : candidate;
     if (typeof configured !== "string" || !path.isAbsolute(configured)) {
       return { status: "UNAPPROVED_CLOUDFLARED_PATH" };
     }
-    const resolved = fs.realpathSync(path.resolve(configured));
-    if (!fs.statSync(resolved).isFile() || resolved.toLowerCase() !== canonical.toLowerCase()) return { status: "UNAPPROVED_CLOUDFLARED_PATH" };
+    const resolved = fs.realpathSync.native(path.resolve(configured));
+    if (!fs.statSync(resolved).isFile() || comparePath(resolved) !== comparePath(canonical)) return { status: "UNAPPROVED_CLOUDFLARED_PATH" };
     return { status: "PASS", path: resolved };
   } catch {
     return candidate === undefined || candidate === null || candidate === ""
