@@ -15,8 +15,15 @@ import {
   type RecoveryFacts,
   type RecoverySessionSnapshot,
 } from "../src/recovery/harness.js";
-import { probeExecutionContext, resolveApprovedCloudflaredPath, type ProbeAdapter } from "../src/recovery/probe.js";
-import { readRecoveryProgress, recoveryProgressFile, writeRecoveryProgress } from "../src/recovery/state.js";
+import { observeBridgeRecoveryProbe, probeExecutionContext, resolveApprovedCloudflaredPath, type ProbeAdapter } from "../src/recovery/probe.js";
+import {
+  consumeLegacyBridgeReplacementMarker,
+  legacyBridgeReplacementMarkerConsumed,
+  readRecoveryProgress,
+  recoveryProgressFile,
+  writeRecoveryProgress,
+} from "../src/recovery/state.js";
+import { replaceLegacyBridgeOnce, type LegacyBridgeMigrationAdapter } from "../src/recovery/legacy-migration.js";
 import type { TunnelProvider } from "../src/tunnel/provider.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
@@ -133,6 +140,83 @@ describe("recovery helper argument forwarding", () => {
     return { result, state: JSON.parse(fs.readFileSync(fixtureFile, "utf8")) as Record<string, any> };
   }
 
+  function runLegacyMigrationFixture(overrides: Record<string, unknown> = {}) {
+    if (process.platform !== "win32") return null;
+    const root = makeTmpDir("recovery-legacy-migration");
+    tempDirs.push(root);
+    const workspace = path.join(root, "MOZI workspace");
+    fs.mkdirSync(workspace, { recursive: true });
+    const stateDir = isolateStateDir();
+    tempDirs.push(stateDir);
+    const sessionFixture: RecoverySessionSnapshot = {
+      url: "https://chatgpt.com/g/g-p-demo/c/legacy-saved-chat",
+      projectUrl: "https://chatgpt.com/g/g-p-demo/project",
+      workflowMode: "design-first",
+      checkpoint: { taskId: "task-legacy", waitingFor: "none" },
+      connectorName: "MOZI v3",
+      taskId: "task-legacy",
+      iteration: 2,
+      lastState: "DONE",
+    };
+    const legacyProbe = {
+      bridgeStatus: "healthy",
+      localProbe,
+      bridgeProbe: null,
+      bridgeProbeError: true,
+      bridgeInfoHealthy: true,
+      bridgeInfoStatus: 200,
+      bridgeInfoErrorKind: null,
+      bridgeInfoTunnelHealth: "UNHEALTHY",
+      bridgeProbeStatus: 404,
+      bridgeProbeErrorKind: "ROUTE_NOT_FOUND",
+      localRecoveryRuntimeSupportsProbe: true,
+    };
+    const currentProbe = {
+      bridgeStatus: "healthy",
+      localProbe,
+      bridgeProbe: localProbe,
+      bridgeProbeError: false,
+      bridgeInfoHealthy: true,
+      bridgeInfoStatus: 200,
+      bridgeInfoErrorKind: null,
+      bridgeInfoTunnelHealth: "UNHEALTHY",
+      bridgeProbeStatus: 200,
+      bridgeProbeErrorKind: null,
+      localRecoveryRuntimeSupportsProbe: true,
+    };
+    const fixtureFile = path.join(root, "scenario.json");
+    const workspaceId = new Workspace(workspace).id;
+    const progressPath = recoveryProgressFile(workspaceId);
+    fs.writeFileSync(fixtureFile, JSON.stringify({
+      calls: [], useRealPlanner: true, session: sessionFixture, workspacePath: workspace,
+      probe: legacyProbe, probeAfterMigration: currentProbe,
+      doctor: {
+        report: { node: { ok: true }, sandbox: { ok: true }, workspace: { ok: true }, bridge: { ok: true }, mcp: { ok: true }, oauth: { ok: true }, tunnel: { ok: false } },
+        chatgptRepair: { needed: false, connectorName: "MOZI v3", mcpUrl: null, previousMcpUrl: "https://old.trycloudflare.com/mcp" },
+        namedRepair: { needed: false },
+      },
+      progressPath,
+      ...overrides,
+    }));
+    writeRecoveryProgress(workspaceId, {
+      state: "LOCAL_DIAGNOSIS",
+      capableContextAttempted: false,
+      bridgeRestartAttempted: false,
+      legacyMigrationAuthorized: false,
+      legacyMigrationAttempted: false,
+      sessionSnapshot: sessionFixture,
+      pairedConnectorName: sessionFixture.connectorName,
+    });
+    const script = path.join(skillRoot, "scripts", "c2c-start-tunnel.ps1");
+    const fakeCli = path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
+      "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli, "-Action", "migrate-legacy"], {
+      encoding: "utf8", windowsHide: true,
+      env: { ...process.env, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixtureFile },
+    });
+    return { result, state: JSON.parse(fs.readFileSync(fixtureFile, "utf8")) as Record<string, any>, workspace, workspaceId };
+  }
+
   it("does not restart a healthy Bridge and runs isolated restart orchestration only for restricted Bridge evidence", () => {
     const healthy = runRestartFixture({
       planAction: "COMPARE_ENDPOINT",
@@ -175,6 +259,53 @@ describe("recovery helper argument forwarding", () => {
     expect(readRecoveryProgress(workspace.id)?.state).toBe("BLOCKED_LOCAL_EXECUTION");
     const later = runCli(["recovery-plan", "--workspace", workspace.root, "--facts-base64", Buffer.from(JSON.stringify(facts()), "utf8").toString("base64"), "--json"]);
     expect(JSON.parse(later.stdout.trim()).nextAction).toBe("BLOCKED_LOCAL_EXECUTION");
+  });
+
+  it("replaces a verified legacy Bridge once, reprobes, and returns to normal Tunnel planning", () => {
+    const run = runLegacyMigrationFixture();
+    if (!run) return;
+    expect(run.result.status, run.result.stdout + run.result.stderr).toBe(0);
+    const response = JSON.parse(run.result.stdout.trim());
+    expect(response.state).toBe("LOCAL_RECOVERY");
+    expect(response.nextAction).toBe("START_TUNNEL");
+    expect(run.state.migrationCalls).toEqual(["stop", "start", "reprobe"]);
+    expect(run.state.calls.some((args: string[]) => args[0] === "recovery-replace-legacy-bridge")).toBe(true);
+    expect(run.state.calls.some((args: string[]) => args[0] === "start" || args[0] === "restart")).toBe(false);
+    const progress = readRecoveryProgress(run.workspaceId);
+    expect(progress).toMatchObject({ state: "LOCAL_RECOVERY", bridgeRestartAttempted: true, legacyMigrationAuthorized: false, legacyMigrationAttempted: true });
+    expect(progress?.sessionSnapshot).toEqual(run.state.session);
+  });
+
+  it("does not repeat replacement when reprobe still finds the legacy route", () => {
+    const legacyProbeAfter = {
+      bridgeStatus: "healthy", localProbe, bridgeProbe: null, bridgeProbeError: true,
+      bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null,
+      bridgeProbeStatus: 404, bridgeProbeErrorKind: "ROUTE_NOT_FOUND", localRecoveryRuntimeSupportsProbe: true,
+    };
+    const run = runLegacyMigrationFixture({ probeAfterMigration: legacyProbeAfter });
+    if (!run) return;
+    expect(run.result.status, run.result.stdout + run.result.stderr).toBe(0);
+    const response = JSON.parse(run.result.stdout.trim());
+    expect(response.state).toBe("BLOCKED_LOCAL_EXECUTION");
+    expect(run.state.migrationCalls).toEqual(["stop", "start", "reprobe"]);
+    expect(readRecoveryProgress(run.workspaceId)).toMatchObject({ state: "BLOCKED_LOCAL_EXECUTION", bridgeRestartAttempted: true, legacyMigrationAttempted: true });
+  });
+
+  it("never invokes legacy replacement without verified route-not-found evidence", () => {
+    const run = runLegacyMigrationFixture({ probe: { ...localProbe, bridgeStatus: "healthy", bridgeInfoHealthy: true, bridgeProbeStatus: 500, bridgeProbeErrorKind: "SERVER_ERROR", bridgeProbeError: true, localRecoveryRuntimeSupportsProbe: true } });
+    if (!run) return;
+    expect(run.result.status, run.result.stdout + run.result.stderr).toBe(0);
+    expect(JSON.parse(run.result.stdout.trim()).state).toBe("BLOCKED_BRIDGE_UNKNOWN");
+    expect(run.state.migrationCalls).toBeUndefined();
+  });
+
+  it("blocks legacy migration if replacement mutates a protected session field", () => {
+    const run = runLegacyMigrationFixture({ mutateFieldOnMigration: "url", mutatedValue: "https://chatgpt.com/g/g-p-demo/c/changed" });
+    if (!run) return;
+    const response = JSON.parse(run.result.stdout.trim());
+    expect(response.state).toBe("BLOCKED_STATE_INCONSISTENT");
+    expect(response.sessionPreserved).toBe(false);
+    expect(readRecoveryProgress(run.workspaceId)).toMatchObject({ state: "BLOCKED_STATE_INCONSISTENT", legacyMigrationAttempted: true });
   });
 
   it.each([
@@ -437,6 +568,497 @@ describe("recovery helper argument forwarding", () => {
 });
 
 describe("safe process probe and recovery planning", () => {
+  it("classifies authenticated recovery-probe 404 as unsupported only when normal admin info is healthy", async () => {
+    const requested: string[] = [];
+    const result = await observeBridgeRecoveryProbe({
+      port: 48765,
+      adminToken: "fixture-admin-token",
+      workspaceId: "workspace-123",
+      fetcher: async (input, init) => {
+        const url = String(input);
+        requested.push(url);
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-admin-token");
+        if (url.endsWith("/admin/info")) return new Response(JSON.stringify({ service: "c2c-bridge", workspaceId: "workspace-123" }), { status: 200 });
+        return new Response("Cannot GET /admin/recovery-probe", { status: 404, headers: { "content-type": "text/html" } });
+      },
+    });
+
+    expect(requested.map((url) => new URL(url).pathname)).toEqual(["/admin/info", "/admin/recovery-probe"]);
+    expect(result).toMatchObject({ bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeProbeStatus: 404, bridgeProbeErrorKind: "ROUTE_NOT_FOUND", bridgeProbe: null });
+  });
+
+  it.each([
+    { name: "explicitly stopped tunnel", tunnel: { running: false, url: null }, publicUrl: null, expected: "UNHEALTHY" },
+    { name: "missing tunnel evidence", tunnel: undefined, publicUrl: null, expected: "UNKNOWN" },
+    { name: "running tunnel with public URL", tunnel: { running: true, url: "https://fixture.trycloudflare.com" }, publicUrl: "https://fixture.trycloudflare.com", expected: "HEALTHY" },
+  ])("reports Tunnel health as $expected when admin info contains $name", async ({ tunnel, publicUrl, expected }) => {
+    const info = { service: "c2c-bridge", workspaceId: "workspace-123", tunnel, publicUrl };
+    const result = await observeBridgeRecoveryProbe({
+      port: 48765,
+      adminToken: "fixture-admin-token",
+      workspaceId: "workspace-123",
+      fetcher: async (input) => String(input).endsWith("/admin/info")
+        ? new Response(JSON.stringify(info), { status: 200 })
+        : new Response("unsupported", { status: 404 }),
+    });
+    expect(result.bridgeInfoTunnelHealth).toBe(expected);
+  });
+
+  it("does not treat non-200 admin info as healthy or continue to the legacy probe", async () => {
+    let probeCalls = 0;
+    const result = await observeBridgeRecoveryProbe({
+      port: 48765, adminToken: "fixture-admin-token", workspaceId: "workspace-123",
+      fetcher: async (input) => {
+        if (String(input).endsWith("/admin/info")) return new Response(null, { status: 204 });
+        probeCalls += 1;
+        return new Response("unsupported", { status: 404 });
+      },
+    });
+    expect(result).toMatchObject({ bridgeInfoHealthy: false, bridgeInfoStatus: 204, bridgeInfoErrorKind: "OTHER" });
+    expect(result.bridgeProbeStatus).toBeNull();
+    expect(probeCalls).toBe(0);
+  });
+
+  it.each([
+    { name: "admin info auth failure", infoStatus: 401, probeStatus: 404, kind: "AUTH_FAILURE", expectedProbeCalls: 0 },
+    { name: "admin info forbidden", infoStatus: 403, probeStatus: 404, kind: "AUTH_FAILURE", expectedProbeCalls: 0 },
+    { name: "admin info unavailable", infoStatus: 404, probeStatus: 404, kind: "ADMIN_INFO_UNAVAILABLE", expectedProbeCalls: 0 },
+    { name: "probe authorization failure", infoStatus: 200, probeStatus: 403, kind: "AUTH_FAILURE", expectedProbeCalls: 1 },
+    { name: "probe server error", infoStatus: 200, probeStatus: 500, kind: "SERVER_ERROR", expectedProbeCalls: 1 },
+    { name: "probe invalid JSON", infoStatus: 200, probeStatus: 200, kind: "INVALID_JSON", expectedProbeCalls: 1, probeBody: "{" },
+    { name: "probe schema mismatch", infoStatus: 200, probeStatus: 200, kind: "SCHEMA_MISMATCH", expectedProbeCalls: 1, probeBody: JSON.stringify({ ok: true, context: "bridge", probe: { classification: "CAPABLE" } }) },
+  ])("preserves non-legacy transport failure: $name", async ({ infoStatus, probeStatus, kind, expectedProbeCalls, probeBody }) => {
+    let probeCalls = 0;
+    const result = await observeBridgeRecoveryProbe({
+      port: 48765,
+      adminToken: "fixture-admin-token",
+      workspaceId: "workspace-123",
+      fetcher: async (input) => {
+        if (String(input).endsWith("/admin/info")) {
+          return new Response(infoStatus === 200 ? JSON.stringify({ service: "c2c-bridge", workspaceId: "workspace-123" }) : "denied", { status: infoStatus });
+        }
+        probeCalls += 1;
+        const body = probeBody ?? JSON.stringify({ ok: true, context: "bridge", probe: localProbe });
+        return new Response(body, { status: probeStatus });
+      },
+    });
+    expect(result.bridgeProbeErrorKind).toBe(kind);
+    expect(probeCalls).toBe(expectedProbeCalls);
+    expect(result.bridgeProbeErrorKind).not.toBe("ROUTE_NOT_FOUND");
+  });
+
+  it("classifies probe timeout and connection failure without claiming legacy support", async () => {
+    const infoResponse = () => new Response(JSON.stringify({ service: "c2c-bridge", workspaceId: "workspace-123" }), { status: 200 });
+    const timeout = await observeBridgeRecoveryProbe({
+      port: 48765, adminToken: "x", workspaceId: "workspace-123",
+      fetcher: async (input) => String(input).endsWith("/admin/info") ? infoResponse() : Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+    });
+    expect(timeout.bridgeProbeErrorKind).toBe("TIMEOUT");
+
+    const connection = await observeBridgeRecoveryProbe({
+      port: 48765, adminToken: "x", workspaceId: "workspace-123",
+      fetcher: async (input) => String(input).endsWith("/admin/info") ? infoResponse() : Promise.reject(Object.assign(new Error("socket reset"), { cause: { code: "ECONNRESET" } })),
+    });
+    expect(connection.bridgeProbeErrorKind).toBe("CONNECTION_FAILURE");
+  });
+
+  it("recovery planner selects one legacy migration only with full evidence and eligibility", () => {
+    const tunnelMissing = { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } }, chatgptRepair: { ...healthyDoctor.chatgptRepair, mcpUrl: null } };
+    const legacy = facts({
+      doctor: tunnelMissing,
+      bridgeStatus: "healthy",
+      bridgeProbe: null,
+      bridgeProbeError: true,
+      bridgeInfoHealthy: true,
+      bridgeInfoStatus: 200,
+      bridgeInfoErrorKind: null,
+      bridgeProbeStatus: 404,
+      bridgeProbeErrorKind: "ROUTE_NOT_FOUND",
+      bridgeInfoTunnelHealth: "UNHEALTHY",
+      localRecoveryRuntimeSupportsProbe: true,
+      recoverySessionSnapshot: session,
+    });
+    expect(planRecovery(legacy)).toMatchObject({ state: "LEGACY_BRIDGE_PROBE_UNSUPPORTED", nextAction: "REPLACE_LEGACY_BRIDGE_ONCE" });
+  });
+
+  it("blocks verified legacy evidence when Tunnel health is UNKNOWN", () => {
+    const result = planRecovery(facts({
+      doctor: { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } } },
+      bridgeStatus: "healthy", bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null,
+      bridgeProbeStatus: 404, bridgeProbeErrorKind: "ROUTE_NOT_FOUND", localRecoveryRuntimeSupportsProbe: true,
+      bridgeInfoTunnelHealth: "UNKNOWN", recoverySessionSnapshot: { ...session },
+    }));
+    expect(result).toMatchObject({ state: "BLOCKED_BRIDGE_UNKNOWN", nextAction: "BLOCKED_BRIDGE_UNKNOWN" });
+  });
+
+  it("rejects legacy evidence unless admin info is exactly HTTP 200", () => {
+    const result = planRecovery(facts({
+      doctor: { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } } },
+      bridgeStatus: "healthy", bridgeInfoHealthy: true, bridgeInfoStatus: 204, bridgeInfoErrorKind: null,
+      bridgeProbeStatus: 404, bridgeProbeErrorKind: "ROUTE_NOT_FOUND", localRecoveryRuntimeSupportsProbe: true,
+      bridgeInfoTunnelHealth: "UNHEALTHY", recoverySessionSnapshot: { ...session },
+    }));
+    expect(result.nextAction).not.toBe("REPLACE_LEGACY_BRIDGE_ONCE");
+  });
+
+  it("resumes BLOCKED_BRIDGE_UNKNOWN in place only when fresh legacy and Tunnel-down evidence is complete", () => {
+    const stateDir = isolateStateDir();
+    tempDirs.push(stateDir);
+    const root = makeTmpDir("recovery-resume-legacy-progress");
+    tempDirs.push(root);
+    write(root, "README.md", "fixture workspace\n");
+    const workspaceId = new Workspace(root).id;
+    const originalSnapshot = { ...session, checkpoint: { ...session.checkpoint } };
+    writeRecoveryProgress(workspaceId, {
+      state: "BLOCKED_BRIDGE_UNKNOWN", capableContextAttempted: true, bridgeRestartAttempted: false,
+      legacyMigrationAuthorized: false, legacyMigrationAttempted: false, sessionSnapshot: originalSnapshot,
+      pairedConnectorName: originalSnapshot.connectorName,
+    });
+    const originalRunId = readRecoveryProgress(workspaceId)?.runId;
+    const base = facts({
+      bridgeStatus: "healthy", bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null,
+      bridgeProbeStatus: 404, bridgeProbeErrorKind: "ROUTE_NOT_FOUND", bridgeProbeError: true,
+      localRecoveryRuntimeSupportsProbe: true, bridgeInfoTunnelHealth: "UNHEALTHY",
+      doctor: { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } }, chatgptRepair: { ...healthyDoctor.chatgptRepair, mcpUrl: null } },
+    });
+    const encoded = (value: RecoveryFacts) => Buffer.from(JSON.stringify(value), "utf8").toString("base64");
+    const resumed = runCli(["recovery-plan", "--workspace", root, "--facts-base64", encoded(base), "--json"]);
+    expect(JSON.parse(resumed.stdout)).toMatchObject({ state: "LEGACY_BRIDGE_PROBE_UNSUPPORTED", nextAction: "REPLACE_LEGACY_BRIDGE_ONCE" });
+    expect(readRecoveryProgress(workspaceId)).toMatchObject({
+      state: "LEGACY_BRIDGE_PROBE_UNSUPPORTED", capableContextAttempted: true, bridgeRestartAttempted: false,
+      legacyMigrationAuthorized: false, legacyMigrationAttempted: false,
+      sessionSnapshot: originalSnapshot, pairedConnectorName: originalSnapshot.connectorName,
+      legacyMigrationResumedFrom: "BLOCKED_BRIDGE_UNKNOWN",
+      legacyMigrationEvidence: { adminInfoStatus: 200, recoveryProbeStatus: 404, tunnelHealth: "UNHEALTHY" },
+      runId: originalRunId,
+    });
+
+    const insufficient = makeTmpDir("recovery-resume-legacy-insufficient");
+    tempDirs.push(insufficient);
+    write(insufficient, "README.md", "fixture workspace\n");
+    const insufficientId = new Workspace(insufficient).id;
+    writeRecoveryProgress(insufficientId, { state: "BLOCKED_BRIDGE_UNKNOWN", capableContextAttempted: true, bridgeRestartAttempted: false, sessionSnapshot: originalSnapshot });
+    const blocked = runCli(["recovery-plan", "--workspace", insufficient, "--facts-base64", encoded({ ...base, bridgeInfoTunnelHealth: "UNKNOWN" }), "--json"]);
+    expect(JSON.parse(blocked.stdout)).toMatchObject({ state: "BLOCKED_BRIDGE_UNKNOWN", nextAction: "BLOCKED_BRIDGE_UNKNOWN" });
+    expect(readRecoveryProgress(insufficientId)).toMatchObject({ state: "BLOCKED_BRIDGE_UNKNOWN", capableContextAttempted: true, sessionSnapshot: originalSnapshot });
+    const rejectedNewRun = runCli(["recovery-plan", "--workspace", insufficient, "--new-run", "--facts-base64", encoded(base), "--json"]);
+    expect(JSON.parse(rejectedNewRun.stdout)).toMatchObject({ state: "BLOCKED_BRIDGE_UNKNOWN", nextAction: "BLOCKED_BRIDGE_UNKNOWN" });
+    expect(readRecoveryProgress(insufficientId)).toMatchObject({ state: "BLOCKED_BRIDGE_UNKNOWN", capableContextAttempted: true, sessionSnapshot: originalSnapshot });
+  });
+
+  it.each([
+    { name: "replacement already attempted", overrides: { bridgeRestartAttempted: true } },
+    { name: "migration action already attempted", overrides: { legacyMigrationAttempted: true } },
+    { name: "local capability failed", overrides: { localProbe: { ...localProbe, nodeChildSpawn: "EPERM" as const, classification: "RESTRICTED_EXECUTION_CONTEXT" as const } } },
+    { name: "Tunnel is healthy", overrides: { doctor: healthyDoctor, bridgeInfoTunnelHealth: "HEALTHY" } },
+    { name: "session snapshot absent", overrides: { recoverySessionSnapshot: null } },
+    { name: "local runtime lacks probe contract", overrides: { localRecoveryRuntimeSupportsProbe: false } },
+  ])("blocks ineligible legacy migration: $name", ({ overrides }) => {
+    const tunnelMissing = { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } }, chatgptRepair: { ...healthyDoctor.chatgptRepair, mcpUrl: null } };
+    const result = planRecovery(facts({
+      doctor: tunnelMissing,
+      bridgeStatus: "healthy",
+      bridgeProbe: null,
+      bridgeProbeError: true,
+      bridgeInfoHealthy: true,
+      bridgeProbeStatus: 404,
+      bridgeProbeErrorKind: "ROUTE_NOT_FOUND",
+      localRecoveryRuntimeSupportsProbe: true,
+      recoverySessionSnapshot: session,
+      ...overrides,
+    }));
+    expect(result.nextAction).not.toBe("REPLACE_LEGACY_BRIDGE_ONCE");
+  });
+
+  it("replaces the verified legacy Bridge once, then requires a successful structured reprobe", async () => {
+    const calls: string[] = [];
+    const adapter: LegacyBridgeMigrationAdapter = {
+      async consumeReplacementAttempt() { return "CONSUMED"; },
+      async readSession() { calls.push("session"); return { ...session }; },
+      async stopCurrentBridge() { calls.push("stop"); return true; },
+      async startCurrentBridge() { calls.push("start"); return { pid: 202 }; },
+      async reprobeCurrentBridge() {
+        calls.push("reprobe");
+        return {
+          bridgeStatus: "healthy",
+          pid: 202,
+          observation: {
+            bridgeInfoHealthy: true,
+            bridgeInfoStatus: 200,
+            bridgeInfoErrorKind: null,
+            bridgeInfoTunnelHealth: "UNHEALTHY",
+            bridgeInfoPublicUrl: null,
+            bridgeProbe: localProbe,
+            bridgeProbeStatus: 200,
+            bridgeProbeErrorKind: null,
+          },
+        };
+      },
+    };
+    const evidence = facts({
+      bridgeRestartAttempted: true,
+      legacyMigrationAuthorized: true,
+      legacyMigrationAttempted: false,
+      recoverySessionSnapshot: { ...session },
+      localRecoveryRuntimeSupportsProbe: true,
+      bridgeInfoHealthy: true,
+      bridgeInfoStatus: 200,
+      bridgeInfoErrorKind: null,
+      bridgeInfoTunnelHealth: "UNHEALTHY",
+      bridgeProbeStatus: 404,
+      bridgeProbeErrorKind: "ROUTE_NOT_FOUND",
+      bridgeProbeError: true,
+      doctor: { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } }, chatgptRepair: { ...healthyDoctor.chatgptRepair, mcpUrl: null } },
+    });
+    const result = await replaceLegacyBridgeOnce(evidence, { authorized: true, alreadyAttempted: false }, 101, adapter);
+    expect(result).toMatchObject({ ok: true, state: "LOCAL_RECOVERY", bridgeStopped: true, bridgeStarted: true, reprobeSucceeded: true, sessionPreserved: true, newPid: 202 });
+    expect(calls.filter((call) => call === "stop")).toHaveLength(1);
+    expect(calls.filter((call) => call === "start")).toHaveLength(1);
+    expect(calls.filter((call) => call === "reprobe")).toHaveLength(1);
+    expect(calls.indexOf("stop")).toBeLessThan(calls.indexOf("start"));
+    expect(calls.indexOf("start")).toBeLessThan(calls.indexOf("reprobe"));
+  });
+
+  it("atomically allows exactly one concurrent replacement for a recovery run", async () => {
+    const stateDir = isolateStateDir();
+    tempDirs.push(stateDir);
+    const root = makeTmpDir("recovery-legacy-marker-race");
+    tempDirs.push(root);
+    write(root, "README.md", "fixture workspace\n");
+    const workspaceId = new Workspace(root).id;
+    writeRecoveryProgress(workspaceId, {
+      state: "LEGACY_BRIDGE_PROBE_UNSUPPORTED", capableContextAttempted: false, bridgeRestartAttempted: true,
+      legacyMigrationAuthorized: true, legacyMigrationAttempted: false, sessionSnapshot: { ...session },
+    });
+    const initialProgress = readRecoveryProgress(workspaceId)!;
+    let sessionReaders = 0;
+    let releaseReaders!: () => void;
+    const bothReadSessions = new Promise<void>((resolve) => { releaseReaders = resolve; });
+    let stopCount = 0;
+    let startCount = 0;
+    const makeAdapter = (): LegacyBridgeMigrationAdapter => {
+      const progress = readRecoveryProgress(workspaceId)!;
+      return {
+        async consumeReplacementAttempt() {
+          const marker = consumeLegacyBridgeReplacementMarker(workspaceId, progress);
+          if (marker !== "CONSUMED") return marker;
+          progress.legacyMigrationAttempted = true;
+          progress.legacyMigrationAuthorized = false;
+          writeRecoveryProgress(workspaceId, progress);
+          return "CONSUMED";
+        },
+        async readSession() {
+          sessionReaders += 1;
+          if (sessionReaders === 2) releaseReaders();
+          await bothReadSessions;
+          return { ...session };
+        },
+        async stopCurrentBridge() { stopCount += 1; return true; },
+        async startCurrentBridge() { startCount += 1; return { pid: 202 }; },
+        async reprobeCurrentBridge() {
+          return {
+            bridgeStatus: "healthy",
+            pid: 202,
+            observation: {
+              bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null,
+              bridgeProbe: { ...localProbe }, bridgeProbeStatus: 200, bridgeProbeErrorKind: null,
+            },
+          };
+        },
+      };
+    };
+    const evidence = facts({
+      bridgeRestartAttempted: true, legacyMigrationAuthorized: true, legacyMigrationAttempted: false,
+      recoverySessionSnapshot: { ...session }, bridgeStatus: "healthy", bridgeInfoHealthy: true,
+      bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbeStatus: 404,
+      bridgeProbeErrorKind: "ROUTE_NOT_FOUND", bridgeProbeError: true,
+      bridgeInfoTunnelHealth: "UNHEALTHY", localRecoveryRuntimeSupportsProbe: true,
+      doctor: { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } }, chatgptRepair: { ...healthyDoctor.chatgptRepair, mcpUrl: null } },
+    });
+
+    const results = await Promise.all([
+      replaceLegacyBridgeOnce(evidence, { authorized: true, alreadyAttempted: false }, 101, makeAdapter()),
+      replaceLegacyBridgeOnce(evidence, { authorized: true, alreadyAttempted: false }, 101, makeAdapter()),
+    ]);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.filter((result) => result.state === "BLOCKED_LOCAL_EXECUTION")).toHaveLength(1);
+    expect(stopCount).toBe(1);
+    expect(startCount).toBe(1);
+    expect(legacyBridgeReplacementMarkerConsumed(workspaceId, initialProgress)).toBe(true);
+    expect(readRecoveryProgress(workspaceId)).toMatchObject({ legacyMigrationAttempted: true });
+  });
+
+  it("treats an existing marker as authoritative when progress still says unattempted", async () => {
+    const stateDir = isolateStateDir();
+    tempDirs.push(stateDir);
+    const root = makeTmpDir("recovery-legacy-marker-authority");
+    tempDirs.push(root);
+    write(root, "README.md", "fixture workspace\n");
+    const workspaceId = new Workspace(root).id;
+    writeRecoveryProgress(workspaceId, {
+      state: "LEGACY_BRIDGE_PROBE_UNSUPPORTED", capableContextAttempted: false, bridgeRestartAttempted: true,
+      legacyMigrationAuthorized: true, legacyMigrationAttempted: false, sessionSnapshot: { ...session },
+    });
+    const progress = readRecoveryProgress(workspaceId)!;
+    expect(consumeLegacyBridgeReplacementMarker(workspaceId, progress)).toBe("CONSUMED");
+    let stopCount = 0;
+    let startCount = 0;
+    const result = await replaceLegacyBridgeOnce(facts({
+      bridgeRestartAttempted: true, legacyMigrationAuthorized: true, legacyMigrationAttempted: false,
+      recoverySessionSnapshot: { ...session }, bridgeStatus: "healthy", bridgeInfoHealthy: true,
+      bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbeStatus: 404,
+      bridgeProbeErrorKind: "ROUTE_NOT_FOUND", bridgeProbeError: true,
+      bridgeInfoTunnelHealth: "UNHEALTHY", localRecoveryRuntimeSupportsProbe: true,
+      doctor: { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } }, chatgptRepair: { ...healthyDoctor.chatgptRepair, mcpUrl: null } },
+    }), { authorized: true, alreadyAttempted: false }, 101, {
+      async consumeReplacementAttempt() { return consumeLegacyBridgeReplacementMarker(workspaceId, progress); },
+      async readSession() { return { ...session }; },
+      async stopCurrentBridge() { stopCount += 1; return true; },
+      async startCurrentBridge() { startCount += 1; return { pid: 202 }; },
+      async reprobeCurrentBridge() { throw new Error("must not reprobe"); },
+    });
+    expect(result.state).toBe("BLOCKED_LOCAL_EXECUTION");
+    expect(stopCount).toBe(0);
+    expect(startCount).toBe(0);
+    expect(readRecoveryProgress(workspaceId)).toMatchObject({ legacyMigrationAttempted: false });
+  });
+
+  it("keeps a consumed marker and blocks after replacement-progress persistence fails", async () => {
+    const stateDir = isolateStateDir();
+    tempDirs.push(stateDir);
+    const root = makeTmpDir("recovery-legacy-marker-write-failure");
+    tempDirs.push(root);
+    write(root, "README.md", "fixture workspace\n");
+    const workspaceId = new Workspace(root).id;
+    writeRecoveryProgress(workspaceId, {
+      state: "LEGACY_BRIDGE_PROBE_UNSUPPORTED", capableContextAttempted: false, bridgeRestartAttempted: true,
+      legacyMigrationAuthorized: true, legacyMigrationAttempted: false, sessionSnapshot: { ...session },
+    });
+    const progress = readRecoveryProgress(workspaceId)!;
+    let stopCount = 0;
+    let startCount = 0;
+    const adapter: LegacyBridgeMigrationAdapter = {
+      async consumeReplacementAttempt() {
+        const marker = consumeLegacyBridgeReplacementMarker(workspaceId, progress);
+        if (marker !== "CONSUMED") return marker;
+        progress.legacyMigrationAttempted = true;
+        progress.legacyMigrationAuthorized = false;
+        try {
+          throw new Error("fixture progress write failure");
+        } catch {
+          return "PROGRESS_WRITE_FAILED";
+        }
+      },
+      async readSession() { return { ...session }; },
+      async stopCurrentBridge() { stopCount += 1; return true; },
+      async startCurrentBridge() { startCount += 1; return { pid: 202 }; },
+      async reprobeCurrentBridge() { throw new Error("must not reprobe"); },
+    };
+    const evidence = facts({
+      bridgeRestartAttempted: true, legacyMigrationAuthorized: true, legacyMigrationAttempted: false,
+      recoverySessionSnapshot: { ...session }, bridgeStatus: "healthy", bridgeInfoHealthy: true,
+      bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbeStatus: 404,
+      bridgeProbeErrorKind: "ROUTE_NOT_FOUND", bridgeProbeError: true,
+      bridgeInfoTunnelHealth: "UNHEALTHY", localRecoveryRuntimeSupportsProbe: true,
+      doctor: { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } }, chatgptRepair: { ...healthyDoctor.chatgptRepair, mcpUrl: null } },
+    });
+    const result = await replaceLegacyBridgeOnce(evidence, { authorized: true, alreadyAttempted: false }, 101, adapter);
+    expect(result.state).toBe("BLOCKED_LOCAL_EXECUTION");
+    expect(stopCount).toBe(0);
+    expect(startCount).toBe(0);
+    expect(legacyBridgeReplacementMarkerConsumed(workspaceId, progress)).toBe(true);
+    expect(readRecoveryProgress(workspaceId)).toMatchObject({ legacyMigrationAttempted: false });
+    const retry = await replaceLegacyBridgeOnce(evidence, { authorized: true, alreadyAttempted: false }, 101, adapter);
+    expect(retry.state).toBe("BLOCKED_LOCAL_EXECUTION");
+    expect(stopCount).toBe(0);
+    expect(startCount).toBe(0);
+  });
+
+  it("creates independent replacement markers for different recovery runs", () => {
+    const stateDir = isolateStateDir();
+    tempDirs.push(stateDir);
+    const root = makeTmpDir("recovery-legacy-marker-distinct-runs");
+    tempDirs.push(root);
+    write(root, "README.md", "fixture workspace\n");
+    const workspaceId = new Workspace(root).id;
+    writeRecoveryProgress(workspaceId, {
+      state: "LEGACY_BRIDGE_PROBE_UNSUPPORTED", capableContextAttempted: false, bridgeRestartAttempted: true,
+      legacyMigrationAuthorized: true, legacyMigrationAttempted: false, sessionSnapshot: { ...session }, runId: "run-one",
+    });
+    const firstRun = readRecoveryProgress(workspaceId)!;
+    const secondRun = { ...firstRun, runId: "run-two" };
+    expect(consumeLegacyBridgeReplacementMarker(workspaceId, firstRun)).toBe("CONSUMED");
+    expect(consumeLegacyBridgeReplacementMarker(workspaceId, secondRun)).toBe("CONSUMED");
+    expect(legacyBridgeReplacementMarkerConsumed(workspaceId, firstRun)).toBe(true);
+    expect(legacyBridgeReplacementMarkerConsumed(workspaceId, secondRun)).toBe(true);
+  });
+
+  it.each([
+    { name: "new Bridge still lacks probe route", observation: { bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbe: null, bridgeProbeStatus: 404, bridgeProbeErrorKind: "ROUTE_NOT_FOUND" as const } },
+    { name: "new Bridge probe returns server error", observation: { bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbe: null, bridgeProbeStatus: 500, bridgeProbeErrorKind: "SERVER_ERROR" as const } },
+    { name: "new Bridge probe is restricted", observation: { bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbe: { ...localProbe, relayFork: "EPERM" as const, classification: "RESTRICTED_BRIDGE_CONTEXT" as const }, bridgeProbeStatus: 200, bridgeProbeErrorKind: null } },
+    { name: "new Bridge capability is incomplete", observation: { bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbe: { ...localProbe, cloudflaredSpawn: "FAIL" as const, classification: "PROBE_FAILED" as const }, bridgeProbeStatus: 200, bridgeProbeErrorKind: null } },
+    { name: "new Bridge admin info status is not exactly 200", observation: { bridgeInfoHealthy: true, bridgeInfoStatus: 204, bridgeInfoErrorKind: null, bridgeProbe: localProbe, bridgeProbeStatus: 200, bridgeProbeErrorKind: null } },
+  ])("blocks migration when $name", async ({ observation }) => {
+    let stopCount = 0;
+    let startCount = 0;
+    let probeCount = 0;
+    const adapter: LegacyBridgeMigrationAdapter = {
+      async consumeReplacementAttempt() { return "CONSUMED"; },
+      async readSession() { return { ...session }; },
+      async stopCurrentBridge() { stopCount += 1; return true; },
+      async startCurrentBridge() { startCount += 1; return { pid: 202 }; },
+      async reprobeCurrentBridge() { probeCount += 1; return { bridgeStatus: "healthy", pid: 202, observation: { ...observation, bridgeInfoTunnelHealth: "UNHEALTHY", bridgeInfoPublicUrl: null } }; },
+    };
+    const evidence = facts({
+      bridgeRestartAttempted: true,
+      legacyMigrationAuthorized: true,
+      legacyMigrationAttempted: false,
+      recoverySessionSnapshot: { ...session },
+      localRecoveryRuntimeSupportsProbe: true,
+      bridgeInfoHealthy: true,
+      bridgeInfoStatus: 200,
+      bridgeInfoErrorKind: null,
+      bridgeInfoTunnelHealth: "UNHEALTHY",
+      bridgeProbeStatus: 404,
+      bridgeProbeErrorKind: "ROUTE_NOT_FOUND",
+      bridgeProbeError: true,
+      doctor: { ...healthyDoctor, report: { ...healthyDoctor.report, tunnel: { ok: false } }, chatgptRepair: { ...healthyDoctor.chatgptRepair, mcpUrl: null } },
+    });
+    const result = await replaceLegacyBridgeOnce(evidence, { authorized: true, alreadyAttempted: false }, 101, adapter);
+    expect(result.state).toBe("BLOCKED_LOCAL_EXECUTION");
+    expect(stopCount).toBe(1);
+    expect(startCount).toBe(1);
+    expect(probeCount).toBe(1);
+  });
+
+  it("does not stop or start anything without one-time replacement authorization", async () => {
+    let calls = 0;
+    const adapter: LegacyBridgeMigrationAdapter = {
+      async consumeReplacementAttempt() { return "CONSUMED"; },
+      async readSession() { calls += 1; return { ...session }; },
+      async stopCurrentBridge() { calls += 1; return true; },
+      async startCurrentBridge() { calls += 1; return { pid: 202 }; },
+      async reprobeCurrentBridge() { calls += 1; return { bridgeStatus: "healthy", pid: 202, observation: { bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbe: localProbe, bridgeProbeStatus: 200, bridgeProbeErrorKind: null } }; },
+    };
+    const result = await replaceLegacyBridgeOnce(facts(), { authorized: false, alreadyAttempted: false }, 101, adapter);
+    expect(result.state).toBe("BLOCKED_LOCAL_EXECUTION");
+    expect(calls).toBe(0);
+  });
+
+  it("rejects migration when persisted state says replacement was already attempted", async () => {
+    let calls = 0;
+    const adapter: LegacyBridgeMigrationAdapter = {
+      async consumeReplacementAttempt() { return "CONSUMED"; },
+      async readSession() { calls += 1; return { ...session }; },
+      async stopCurrentBridge() { calls += 1; return true; },
+      async startCurrentBridge() { calls += 1; return { pid: 202 }; },
+      async reprobeCurrentBridge() { calls += 1; return { bridgeStatus: "healthy", pid: 202, observation: { bridgeInfoHealthy: true, bridgeInfoStatus: 200, bridgeInfoErrorKind: null, bridgeProbe: localProbe, bridgeProbeStatus: 200, bridgeProbeErrorKind: null } }; },
+    };
+    const result = await replaceLegacyBridgeOnce(facts({ bridgeRestartAttempted: true, legacyMigrationAuthorized: true, legacyMigrationAttempted: true }), { authorized: true, alreadyAttempted: false }, 101, adapter);
+    expect(result.state).toBe("BLOCKED_LOCAL_EXECUTION");
+    expect(calls).toBe(0);
+  });
   it("allows only the canonical C2C-managed cloudflared executable", () => {
     const root = makeTmpDir("cloudflared-allowlist");
     tempDirs.push(root);
@@ -842,7 +1464,7 @@ describe("safe process probe and recovery planning", () => {
     const stateDir = isolateStateDir();
     tempDirs.push(stateDir);
     writeRecoveryProgress("workspace-123", { state: "WAIT_PAIR_CODE_GENERATION", capableContextAttempted: true, bridgeRestartAttempted: false });
-    expect(readRecoveryProgress("workspace-123")).toEqual({ state: "WAIT_PAIR_CODE_GENERATION", capableContextAttempted: true, bridgeRestartAttempted: false });
+    expect(readRecoveryProgress("workspace-123")).toMatchObject({ state: "WAIT_PAIR_CODE_GENERATION", capableContextAttempted: true, bridgeRestartAttempted: false });
     expect(recoveryProgressFile("workspace-123")).toContain("recovery-progress");
   });
 

@@ -22,11 +22,13 @@ Follow the returned `state` and `nextAction`; do not infer a different path.
 - If local process creation remains blocked after one capable-context retry,
   report `BLOCKED_LOCAL_EXECUTION` and stop. Do not hand commands to the user.
 
-## State machine
-
-```text
-START → LOCAL_DIAGNOSIS → LOCAL_RECOVERY → LOCAL_HEALTH_PASS
-  → ENDPOINT_COMPARE
+START → LOCAL_DIAGNOSIS
+  ├─ verified legacy Bridge (authenticated /admin/info 200 + /admin/recovery-probe 404)
+  │    → LEGACY_BRIDGE_PROBE_UNSUPPORTED
+  │    → one authorized Bridge replacement → immediate info/probe verification
+  └─ other recoverable failure → existing LOCAL_RECOVERY
+       ↓
+     LOCAL_HEALTH_PASS → ENDPOINT_COMPARE
       ├─ CONNECTOR_STILL_VALID → POST_RECOVERY_VERIFY → COMPLETE
       └─ CONNECTOR_UPDATE_REQUIRED → HUMAN_MCP_APP_GATE
            → WAIT_PAIR_CODE_GENERATION → WAIT_PAIRING_COMPLETE
@@ -41,12 +43,24 @@ The structured helper may instead return `BLOCKED_LOCAL_EXECUTION`,
 ## Procedure
 
 1. Resolve the current workspace, canonical `C2C_STATE_DIR`, and installed C2C
-   CLI from known paths/environment only. Start one recovery run with
-   `scripts/c2c-status.ps1 -StartNewRecovery` through the local execution tool.
-   The run state and one-escalation flag are stored separately under the C2C
-   state directory; the C2C session schema remains unchanged.
-2. Follow `nextAction`. Use `scripts/c2c-start-tunnel.ps1` only for
-   `START_BRIDGE_AND_TUNNEL` or `START_TUNNEL`. Use its `restart` action only
+   CLI from known paths/environment only. First run `scripts/c2c-status.ps1`
+   without `-StartNewRecovery` so any existing progress is resumed. Only if the
+   result explicitly says there is no active recovery run, start one with
+   `scripts/c2c-status.ps1 -StartNewRecovery`. In particular, an existing
+   `BLOCKED_BRIDGE_UNKNOWN` run is re-evaluated in place from fresh Bridge
+   evidence; never replace it with a new run. The run state and one-escalation
+   flag are stored separately under the C2C state directory; the C2C session
+   schema remains unchanged.
+2. Follow `nextAction`. For `REPLACE_LEGACY_BRIDGE_ONCE`, require authenticated
+   `/admin/info` success, probe HTTP 404, local process capability `CAPABLE`,
+   unhealthy Tunnel, an unchanged session snapshot, and no prior Bridge replacement.
+   Run `scripts/c2c-start-tunnel.ps1 -Action migrate-legacy` once. The helper stops
+   only the verified managed Bridge, starts the current runtime, rechecks `/admin/info`
+   and `/admin/recovery-probe`, and verifies the protected session before continuing
+   through the normal Tunnel path. If the replacement still lacks a structured probe
+   or any check fails, report the blocked state and stop. Never retry replacement.
+   Use `scripts/c2c-start-tunnel.ps1` only for `START_BRIDGE_AND_TUNNEL` or
+   `START_TUNNEL`. Use its `restart` action only
    when the existing Bridge probe classifies `RESTRICTED_BRIDGE_CONTEXT` and
    local probe classifies `CAPABLE`. Snapshot the session before and after any
    restart and require URL, Project URL, workflow mode, checkpoint, task id,

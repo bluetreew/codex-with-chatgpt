@@ -61,9 +61,15 @@ import {
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { formatArtifactSyncReceipt, materializeArtifact, parseArtifactBundle, validateArtifactTargets } from "../artifact-sync.js";
-import { planRecovery, type RecoveryFacts } from "../recovery/harness.js";
-import { probeExecutionContext } from "../recovery/probe.js";
-import { readRecoveryProgress, writeRecoveryProgress } from "../recovery/state.js";
+import { planRecovery, snapshotRecoverySession, type RecoveryFacts } from "../recovery/harness.js";
+import { observeBridgeRecoveryProbe, probeExecutionContext, type BridgeProbeObservation } from "../recovery/probe.js";
+import { legacyMigrationEligibility, replaceLegacyBridgeOnce, resumeBlockedBridgeUnknownAsLegacy } from "../recovery/legacy-migration.js";
+import {
+  consumeLegacyBridgeReplacementMarker,
+  createRecoveryRunId,
+  readRecoveryProgress,
+  writeRecoveryProgress,
+} from "../recovery/state.js";
 
 const program = new Command();
 
@@ -75,6 +81,19 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
 }
 
 function parseInteger(value: string): number {
@@ -799,18 +818,27 @@ program
       const observation = await findBridgeObservation(workspace.id);
       let bridgeProbe: Awaited<ReturnType<typeof probeExecutionContext>> | null = null;
       let bridgeProbeError = false;
+      let bridgeInfoHealthy = false;
+      let bridgeInfoStatus: number | null = null;
+      let bridgeInfoErrorKind: string | null = null;
+      let bridgeInfoTunnelHealth: "HEALTHY" | "UNHEALTHY" | "UNKNOWN" = "UNKNOWN";
+      let bridgeProbeStatus: number | null = null;
+      let bridgeProbeErrorKind: string | null = null;
       if (observation.state === "healthy") {
-        try {
-          const response = await adminFetch<{ ok: boolean; probe: Awaited<ReturnType<typeof probeExecutionContext>> }>(
-            observation.runtime,
-            "GET",
-            "/admin/recovery-probe",
-            12_000
-          );
-          bridgeProbe = response.probe;
-        } catch {
-          bridgeProbeError = true;
-        }
+        const bridgeObservation = await observeBridgeRecoveryProbe({
+          port: observation.runtime.port,
+          adminToken: observation.runtime.adminToken,
+          workspaceId: workspace.id,
+          timeoutMs: 12_000,
+        });
+        bridgeProbe = bridgeObservation.bridgeProbe;
+        bridgeProbeError = bridgeObservation.bridgeProbeErrorKind !== null;
+        bridgeInfoHealthy = bridgeObservation.bridgeInfoHealthy;
+        bridgeInfoStatus = bridgeObservation.bridgeInfoStatus;
+        bridgeInfoErrorKind = bridgeObservation.bridgeInfoErrorKind;
+        bridgeInfoTunnelHealth = bridgeObservation.bridgeInfoTunnelHealth ?? "UNKNOWN";
+        bridgeProbeStatus = bridgeObservation.bridgeProbeStatus;
+        bridgeProbeErrorKind = bridgeObservation.bridgeProbeErrorKind;
       }
       const payload = {
         ok: true,
@@ -820,6 +848,13 @@ program
         localProbe,
         bridgeProbe,
         bridgeProbeError,
+        bridgeInfoHealthy,
+        bridgeInfoStatus,
+        bridgeInfoErrorKind,
+        bridgeInfoTunnelHealth,
+        bridgeProbeStatus,
+        bridgeProbeErrorKind,
+        localRecoveryRuntimeSupportsProbe: true,
       };
       if (opts.json) say(JSON.stringify(payload));
       else say(JSON.stringify(payload, null, 2));
@@ -843,17 +878,39 @@ program
       if (opts.newRun && facts.transitionEvent) throw new Error("--new-run cannot be combined with a recovery transition event");
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const workspaceId = workspace.id;
-      let progress = null;
-      if (opts.newRun) {
-        progress = { state: "LOCAL_DIAGNOSIS" as const, capableContextAttempted: false, bridgeRestartAttempted: false, sessionSnapshot: facts.session ?? null };
+      let progress = readRecoveryProgress(workspaceId);
+      const refuseNewRun = opts.newRun && progress?.state === "BLOCKED_BRIDGE_UNKNOWN";
+      if (opts.newRun && !refuseNewRun) {
+        progress = { runId: createRecoveryRunId(), state: "LOCAL_DIAGNOSIS" as const, capableContextAttempted: false, bridgeRestartAttempted: false, legacyMigrationAuthorized: false, legacyMigrationAttempted: false, sessionSnapshot: facts.session ?? null };
         writeRecoveryProgress(workspaceId, progress);
-      } else {
-        progress = readRecoveryProgress(workspaceId);
+      }
+      if (progress) {
+        facts.recoverySessionSnapshot = progress.sessionSnapshot ?? null;
+        facts.legacyMigrationAuthorized = progress.legacyMigrationAuthorized === true;
+        facts.legacyMigrationAttempted = progress.legacyMigrationAttempted === true;
       }
 
       let result;
       const terminalStates = new Set(["COMPLETE", "BLOCKED_LOCAL_EXECUTION", "BLOCKED_STATE_INCONSISTENT", "BLOCKED_BRIDGE_UNKNOWN", "LOCAL_RECOVERY_FAILED", "UNAPPROVED_CLOUDFLARED_PATH", "INVALID_RECOVERY_TRANSITION"]);
-      if (!opts.newRun && facts.transitionEvent && progress && terminalStates.has(progress.state)) {
+      if (!opts.newRun && !facts.transitionEvent && progress?.state === "BLOCKED_BRIDGE_UNKNOWN") {
+        const resumed = resumeBlockedBridgeUnknownAsLegacy(progress, facts);
+        if (resumed) {
+          progress = resumed;
+          facts.recoveryState = resumed.state;
+          facts.recoverySessionSnapshot = resumed.sessionSnapshot ?? null;
+          facts.legacyMigrationAuthorized = resumed.legacyMigrationAuthorized === true;
+          facts.legacyMigrationAttempted = resumed.legacyMigrationAttempted === true;
+        }
+      }
+      if (refuseNewRun) {
+        result = {
+          ok: false,
+          state: "BLOCKED_BRIDGE_UNKNOWN" as const,
+          nextAction: "BLOCKED_BRIDGE_UNKNOWN" as const,
+          humanActionRequired: false,
+          facts: { reason: "a blocked recovery run must be explicitly re-evaluated in place; --new-run cannot replace its progress" },
+        };
+      } else if (!opts.newRun && facts.transitionEvent && progress && terminalStates.has(progress.state)) {
         result = {
           ok: false,
           state: "INVALID_RECOVERY_TRANSITION" as const,
@@ -927,14 +984,24 @@ program
         }
         if (!result) result = planRecovery(facts);
       }
-      if (opts.authorizeRestart && result.nextAction === "RESTART_BRIDGE_IN_CAPABLE_CONTEXT" && progress) {
-        progress = { ...progress, state: result.state, bridgeRestartAttempted: true };
+      if (opts.authorizeRestart && ["RESTART_BRIDGE_IN_CAPABLE_CONTEXT", "REPLACE_LEGACY_BRIDGE_ONCE"].includes(result.nextAction) && progress) {
+        progress = {
+          ...progress,
+          state: result.state,
+          bridgeRestartAttempted: true,
+          legacyMigrationAuthorized: result.nextAction === "REPLACE_LEGACY_BRIDGE_ONCE" || progress.legacyMigrationAuthorized === true,
+        };
       }
-      if ((opts.newRun || progress) && result.state !== "INVALID_RECOVERY_TRANSITION") {
+      if (!refuseNewRun && (opts.newRun || progress) && result.state !== "INVALID_RECOVERY_TRANSITION") {
         writeRecoveryProgress(workspaceId, {
+          runId: progress?.runId ?? createRecoveryRunId(),
           state: result.state,
           capableContextAttempted: Boolean(progress?.capableContextAttempted || ("capableContextAttempted" in result.facts && result.facts.capableContextAttempted)),
           bridgeRestartAttempted: Boolean(progress?.bridgeRestartAttempted),
+          legacyMigrationAuthorized: progress?.legacyMigrationAuthorized === true,
+          legacyMigrationAttempted: progress?.legacyMigrationAttempted === true,
+          legacyMigrationResumedFrom: progress?.legacyMigrationResumedFrom,
+          legacyMigrationEvidence: progress?.legacyMigrationEvidence,
           sessionSnapshot: progress?.sessionSnapshot ?? facts.session ?? null,
           pairedConnectorName: progress?.pairedConnectorName ?? (facts.transitionEvent === "PAIRING_COMPLETED" && result.state === "AI_CONFIRM_CONNECTOR" ? facts.actualConnectorName : undefined),
         });
@@ -942,6 +1009,142 @@ program
       if (opts.json) say(JSON.stringify(result));
       else say(JSON.stringify(result, null, 2));
     } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+program
+  .command("recovery-replace-legacy-bridge", { hidden: true })
+  .description("Replace one explicitly authorized legacy Bridge without starting its Tunnel")
+  .requiredOption("--workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace: string; json: boolean }) => {
+    let workspace: Workspace | null = null;
+    let progress = null as ReturnType<typeof readRecoveryProgress>;
+    try {
+      workspace = new Workspace(resolveWorkspace(opts.workspace));
+      progress = readRecoveryProgress(workspace.id);
+      if (!progress || progress.state !== "LEGACY_BRIDGE_PROBE_UNSUPPORTED" ||
+          !progress.bridgeRestartAttempted || progress.legacyMigrationAuthorized !== true || progress.legacyMigrationAttempted === true) {
+        say(JSON.stringify({ ok: false, state: "INVALID_RECOVERY_TRANSITION", reason: "legacy replacement was not selected and authorized exactly once by the recovery planner" }));
+        return;
+      }
+
+      const current = await findBridgeObservation(workspace.id);
+      if (current.state !== "healthy") {
+        progress.state = "BLOCKED_BRIDGE_UNKNOWN";
+        progress.legacyMigrationAuthorized = false;
+        writeRecoveryProgress(workspace.id, progress);
+        say(JSON.stringify({ ok: false, state: progress.state, reason: `Bridge is no longer healthy (${current.state})` }));
+        return;
+      }
+
+      const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspace.id));
+      const localProbe = await probeExecutionContext({ context: "local", cloudflaredPath: profile?.cloudflaredPath });
+      const probe = await observeBridgeRecoveryProbe({
+        port: current.runtime.port,
+        adminToken: current.runtime.adminToken,
+        workspaceId: workspace.id,
+        timeoutMs: 12_000,
+      });
+      const currentSession = readSession(workspace.id);
+      const facts: RecoveryFacts = {
+        workspace: { workspaceId: workspace.id, name: workspace.name },
+        session: currentSession ? snapshotRecoverySession(currentSession) : null,
+        recoverySessionSnapshot: progress.sessionSnapshot ?? null,
+        bridgeStatus: "healthy",
+        bridgeProbe: probe.bridgeProbe ?? undefined,
+        bridgeProbeError: probe.bridgeProbeErrorKind !== null,
+        bridgeInfoHealthy: probe.bridgeInfoHealthy,
+        bridgeInfoStatus: probe.bridgeInfoStatus,
+        bridgeInfoErrorKind: probe.bridgeInfoErrorKind,
+        bridgeInfoTunnelHealth: probe.bridgeInfoTunnelHealth,
+        bridgeProbeStatus: probe.bridgeProbeStatus,
+        bridgeProbeErrorKind: probe.bridgeProbeErrorKind,
+        localRecoveryRuntimeSupportsProbe: true,
+        localProbe,
+        bridgeRestartAttempted: progress.bridgeRestartAttempted,
+        legacyMigrationAuthorized: progress.legacyMigrationAuthorized,
+        legacyMigrationAttempted: progress.legacyMigrationAttempted,
+        doctor: { report: { tunnel: { ok: probe.bridgeInfoTunnelHealth === "HEALTHY" } } },
+      };
+      const eligibility = legacyMigrationEligibility(facts);
+      if (!eligibility.eligible) {
+        progress.state = eligibility.state;
+        progress.legacyMigrationAuthorized = false;
+        writeRecoveryProgress(workspace.id, progress);
+        say(JSON.stringify({ ok: false, state: progress.state, reason: eligibility.reason, bridgeProbe: probe, localProbe }));
+        return;
+      }
+
+      const migration = await replaceLegacyBridgeOnce(
+        facts,
+        { authorized: true, alreadyAttempted: false },
+        current.runtime.pid,
+        {
+          async consumeReplacementAttempt() {
+            const marker = consumeLegacyBridgeReplacementMarker(workspace!.id, progress!);
+            if (marker !== "CONSUMED") return marker;
+            progress!.legacyMigrationAttempted = true;
+            progress!.legacyMigrationAuthorized = false;
+            try {
+              writeRecoveryProgress(workspace!.id, progress!);
+            } catch {
+              return "PROGRESS_WRITE_FAILED";
+            }
+            return "CONSUMED";
+          },
+          async readSession() {
+            const saved = readSession(workspace!.id);
+            return saved ? snapshotRecoverySession(saved) : null;
+          },
+          async stopCurrentBridge() {
+            const stopped = await stopBridge(workspace!.root);
+            return stopped && await waitForProcessExit(current.runtime.pid);
+          },
+          async startCurrentBridge() {
+            const started = await ensureBridge(workspace!.root);
+            return { pid: started.runtime.pid };
+          },
+          async reprobeCurrentBridge() {
+            const observation = await findBridgeObservation(workspace!.id);
+            if (observation.state !== "healthy") {
+              return {
+                bridgeStatus: observation.state,
+                pid: observation.runtime?.pid,
+                observation: {
+                  bridgeInfoHealthy: false,
+                  bridgeInfoStatus: null,
+                  bridgeInfoErrorKind: "CONNECTION_FAILURE",
+                  bridgeProbe: null,
+                  bridgeProbeStatus: null,
+                  bridgeProbeErrorKind: "CONNECTION_FAILURE",
+                },
+              };
+            }
+            const reprobe = await observeBridgeRecoveryProbe({
+              port: observation.runtime.port,
+              adminToken: observation.runtime.adminToken,
+              workspaceId: workspace!.id,
+              timeoutMs: 12_000,
+            });
+            return { bridgeStatus: "healthy", pid: observation.runtime.pid, observation: reprobe };
+          },
+        }
+      );
+
+      progress.state = migration.state;
+      progress.legacyMigrationAuthorized = false;
+      writeRecoveryProgress(workspace.id, progress);
+      say(JSON.stringify({ ...migration, bridgeRestartAttempted: true, legacyMigrationAttempted: true }));
+    } catch (error) {
+      if (workspace && progress?.legacyMigrationAttempted === true) {
+        progress.state = "BLOCKED_LOCAL_EXECUTION";
+        progress.legacyMigrationAuthorized = false;
+        writeRecoveryProgress(workspace.id, progress);
+        say(JSON.stringify({ ok: false, state: progress.state, reason: error instanceof Error ? error.message : String(error), bridgeRestartAttempted: true, legacyMigrationAttempted: true }));
+        return;
+      }
       handleCliError(error, opts.json);
     }
   });

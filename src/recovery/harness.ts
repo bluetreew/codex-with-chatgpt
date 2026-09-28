@@ -1,3 +1,5 @@
+import { hasVerifiedLegacyBridgeEvidence, legacyMigrationEligibility } from "./legacy-migration.js";
+
 export type ProbeStatus = "PASS" | "EPERM" | "FAIL" | "NOT_CONFIGURED" | "UNAPPROVED_CLOUDFLARED_PATH";
 export type ExecutionContext = "standard" | "capable";
 export type BridgeContext = "local" | "bridge";
@@ -14,6 +16,17 @@ export interface ExecutionProbe {
     | "UNAPPROVED_CLOUDFLARED_PATH"
     | "PROBE_FAILED";
 }
+
+export type BridgeProbeErrorKind =
+  | "ROUTE_NOT_FOUND"
+  | "AUTH_FAILURE"
+  | "SERVER_ERROR"
+  | "CONNECTION_FAILURE"
+  | "TIMEOUT"
+  | "INVALID_JSON"
+  | "SCHEMA_MISMATCH"
+  | "ADMIN_INFO_UNAVAILABLE"
+  | "OTHER";
 
 export interface RecoverySessionSnapshot {
   url?: string;
@@ -106,6 +119,7 @@ export type RecoveryAction =
   | "START_TUNNEL"
   | "RETRY_CAPABLE_CONTEXT"
   | "RESTART_BRIDGE_IN_CAPABLE_CONTEXT"
+  | "REPLACE_LEGACY_BRIDGE_ONCE"
   | "COMPARE_ENDPOINT"
   | "HUMAN_MCP_APP_GATE"
   | "AI_GENERATE_PAIR_CODE"
@@ -123,6 +137,7 @@ export type RecoveryAction =
 export type RecoveryState =
   | "LOCAL_DIAGNOSIS"
   | "LOCAL_RECOVERY"
+  | "LEGACY_BRIDGE_PROBE_UNSUPPORTED"
   | "LOCAL_HEALTH_PASS"
   | "ENDPOINT_COMPARE"
   | "HUMAN_MCP_APP_GATE"
@@ -165,9 +180,19 @@ export interface RecoveryFacts {
   localProbe?: ExecutionProbe;
   bridgeProbe?: ExecutionProbe;
   bridgeProbeError?: boolean;
+  bridgeInfoHealthy?: boolean;
+  bridgeInfoStatus?: number | null;
+  bridgeInfoErrorKind?: BridgeProbeErrorKind | null;
+  bridgeInfoTunnelHealth?: "HEALTHY" | "UNHEALTHY" | "UNKNOWN";
+  bridgeProbeStatus?: number | null;
+  bridgeProbeErrorKind?: BridgeProbeErrorKind | null;
+  localRecoveryRuntimeSupportsProbe?: boolean;
+  recoverySessionSnapshot?: RecoverySessionSnapshot | null;
   executionContext?: ExecutionContext;
   capableContextAttempted?: boolean;
   bridgeRestartAttempted?: boolean;
+  legacyMigrationAuthorized?: boolean;
+  legacyMigrationAttempted?: boolean;
   recoveryState?: RecoveryState;
   transitionEvent?: RecoveryEvent;
   requestedMcpUrl?: string;
@@ -268,7 +293,7 @@ export function planRecovery(facts: RecoveryFacts): RecoveryPlan {
     const validRequestedEndpoint = facts.transitionEvent !== "CONNECTOR_CONFIRM_REQUESTED" ||
       normalizeEndpoint(facts.requestedMcpUrl) === normalizeEndpoint(facts.doctor?.chatgptRepair?.mcpUrl);
     const validSourceState = facts.transitionEvent === "SESSION_PRESERVATION_FAILED"
-      ? ["LOCAL_RECOVERY", "CONFIRMING_CONNECTOR", "POST_RECOVERY_VERIFY"].includes(facts.recoveryState ?? "")
+      ? ["LOCAL_RECOVERY", "LEGACY_BRIDGE_PROBE_UNSUPPORTED", "CONFIRMING_CONNECTOR", "POST_RECOVERY_VERIFY"].includes(facts.recoveryState ?? "")
       : facts.recoveryState === transition.from;
     if (!validSourceState || !validLocalHealth || !validEndpointGate || !validConnector || !validConfirmation || !validRequestedEndpoint) {
       return plan("INVALID_RECOVERY_TRANSITION", "INVALID_RECOVERY_TRANSITION", false, false, {
@@ -325,6 +350,23 @@ export function planRecovery(facts: RecoveryFacts): RecoveryPlan {
     if (facts.bridgeStatus === "unknown") {
       return plan("BLOCKED_BRIDGE_UNKNOWN", "BLOCKED_BRIDGE_UNKNOWN", false, false, {
         reason: "existing Bridge status is unknown; do not start a second Bridge",
+      });
+    }
+
+    if (hasVerifiedLegacyBridgeEvidence(facts)) {
+      if (facts.bridgeRestartAttempted || facts.legacyMigrationAttempted) {
+        return plan("BLOCKED_LOCAL_EXECUTION", "BLOCKED_LOCAL_EXECUTION", false, false, {
+          reason: "the one permitted legacy Bridge replacement was already authorized or attempted",
+        });
+      }
+      const eligibility = legacyMigrationEligibility(facts);
+      if (!eligibility.eligible) {
+        return plan(eligibility.state, eligibility.state, false, false, { reason: eligibility.reason });
+      }
+      return plan("LEGACY_BRIDGE_PROBE_UNSUPPORTED", "REPLACE_LEGACY_BRIDGE_ONCE", false, false, {
+        reason: "authenticated Bridge info works but this live Bridge does not implement the current recovery-probe route",
+        bridgeRestartAttempted: true,
+        legacyMigrationAuthorized: true,
       });
     }
 

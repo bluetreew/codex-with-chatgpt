@@ -35,6 +35,13 @@ $facts = [ordered]@{
     localProbe = $probe.localProbe
     bridgeProbe = $probe.bridgeProbe
     bridgeProbeError = $probe.bridgeProbeError
+    bridgeInfoHealthy = $probe.bridgeInfoHealthy
+    bridgeInfoStatus = $probe.bridgeInfoStatus
+    bridgeInfoErrorKind = $probe.bridgeInfoErrorKind
+    bridgeInfoTunnelHealth = $probe.bridgeInfoTunnelHealth
+    bridgeProbeStatus = $probe.bridgeProbeStatus
+    bridgeProbeErrorKind = $probe.bridgeProbeErrorKind
+    localRecoveryRuntimeSupportsProbe = $probe.localRecoveryRuntimeSupportsProbe
     executionContext = $RunContext
     capableContextAttempted = $CapableContextAttempted
 }

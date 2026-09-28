@@ -17,6 +17,20 @@ else if (command === "workspace") emit({ workspaceId: "fixture-workspace", name:
 else if (command === "status") emit({ ok: true, running: true });
 else if (command === "doctor") emit(fixture.doctor);
 else if (command === "recovery-probe") emit(fixture.probe);
+else if (command === "recovery-replace-legacy-bridge") {
+  fixture.migrationCalls = ["stop", "start", "reprobe"];
+  if (fixture.mutateFieldOnMigration) fixture.session[fixture.mutateFieldOnMigration] = fixture.mutatedValue;
+  if (fixture.probeAfterMigration) fixture.probe = fixture.probeAfterMigration;
+  if (fixture.progressPath && fs.existsSync(fixture.progressPath)) {
+    const progress = JSON.parse(fs.readFileSync(fixture.progressPath, "utf8"));
+    progress.state = "LOCAL_RECOVERY";
+    progress.legacyMigrationAuthorized = false;
+    progress.legacyMigrationAttempted = true;
+    fs.writeFileSync(fixture.progressPath, JSON.stringify(progress));
+  }
+  persist();
+  emit({ ok: true, state: "LOCAL_RECOVERY", bridgeStopped: true, bridgeStarted: true, reprobeSucceeded: true, sessionPreserved: true });
+}
 else if (command === "recovery-plan") {
   if (fixture.useRealPlanner) {
     persist();

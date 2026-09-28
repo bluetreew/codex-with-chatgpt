@@ -3,7 +3,154 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getStateDir } from "../config/paths.js";
-import { classifyProbe, type BridgeContext, type ExecutionProbe, type ProbeStatus } from "./harness.js";
+import { classifyProbe, type BridgeContext, type BridgeProbeErrorKind, type ExecutionProbe, type ProbeStatus } from "./harness.js";
+
+export interface BridgeProbeObservation {
+  bridgeInfoHealthy: boolean;
+  bridgeInfoStatus: number | null;
+  bridgeInfoErrorKind: BridgeProbeErrorKind | null;
+  bridgeInfoTunnelHealth?: "HEALTHY" | "UNHEALTHY" | "UNKNOWN";
+  bridgeInfoPublicUrl?: string | null;
+  bridgeProbe: ExecutionProbe | null;
+  bridgeProbeStatus: number | null;
+  bridgeProbeErrorKind: BridgeProbeErrorKind | null;
+}
+
+function transportErrorKind(error: unknown): BridgeProbeErrorKind {
+  const value = error as NodeJS.ErrnoException;
+  if (value.name === "AbortError") return "TIMEOUT";
+  const code = value.cause && typeof value.cause === "object"
+    ? (value.cause as NodeJS.ErrnoException).code
+    : value.code;
+  if (["ECONNREFUSED", "ECONNRESET", "EHOSTUNREACH", "ENETUNREACH", "EPIPE", "ENOTFOUND"].includes(code ?? "")) {
+    return "CONNECTION_FAILURE";
+  }
+  return "OTHER";
+}
+
+function httpErrorKind(status: number, phase: "info" | "probe"): BridgeProbeErrorKind {
+  if (status === 401 || status === 403) return "AUTH_FAILURE";
+  if (status >= 500) return "SERVER_ERROR";
+  if (phase === "info" && status === 404) return "ADMIN_INFO_UNAVAILABLE";
+  if (phase === "probe" && status === 404) return "ROUTE_NOT_FOUND";
+  return "OTHER";
+}
+
+function isExecutionProbe(value: unknown): value is ExecutionProbe {
+  if (!value || typeof value !== "object") return false;
+  const probe = value as Partial<ExecutionProbe>;
+  const statuses: ProbeStatus[] = ["PASS", "EPERM", "FAIL", "NOT_CONFIGURED", "UNAPPROVED_CLOUDFLARED_PATH"];
+  const classifications: ExecutionProbe["classification"][] = [
+    "CAPABLE", "RESTRICTED_EXECUTION_CONTEXT", "RESTRICTED_BRIDGE_CONTEXT", "CLOUDFLARED_UNAVAILABLE", "UNAPPROVED_CLOUDFLARED_PATH", "PROBE_FAILED",
+  ];
+  return statuses.includes(probe.nodeChildSpawn as ProbeStatus) &&
+    statuses.includes(probe.cloudflaredSpawn as ProbeStatus) &&
+    statuses.includes(probe.relayFork as ProbeStatus) &&
+    classifications.includes(probe.classification as ExecutionProbe["classification"]);
+}
+
+/** Read the authenticated admin-info and recovery-probe routes without changing Bridge state. */
+export async function observeBridgeRecoveryProbe(options: {
+  port: number;
+  adminToken: string;
+  workspaceId: string;
+  timeoutMs?: number;
+  fetcher?: typeof fetch;
+}): Promise<BridgeProbeObservation> {
+  const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 12_000;
+  const request = async (route: string): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetcher(`http://127.0.0.1:${options.port}${route}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${options.adminToken}` },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const failed = (
+    bridgeInfoStatus: number | null,
+    bridgeInfoErrorKind: BridgeProbeErrorKind | null,
+    bridgeProbeStatus: number | null,
+    bridgeProbeErrorKind: BridgeProbeErrorKind
+  ): BridgeProbeObservation => ({
+    bridgeInfoHealthy: false,
+    bridgeInfoStatus,
+    bridgeInfoErrorKind,
+    bridgeInfoTunnelHealth: "UNKNOWN",
+    bridgeProbe: null,
+    bridgeProbeStatus,
+    bridgeProbeErrorKind,
+  });
+
+  let infoResponse: Response;
+  try {
+    infoResponse = await request("/admin/info");
+  } catch (error) {
+    const kind = transportErrorKind(error);
+    return failed(null, kind, null, kind);
+  }
+  if (infoResponse.status !== 200) {
+    const kind = httpErrorKind(infoResponse.status, "info");
+    return failed(infoResponse.status, kind, null, kind);
+  }
+
+  let info: unknown;
+  try {
+    info = JSON.parse(await infoResponse.text());
+  } catch {
+    return failed(infoResponse.status, "SCHEMA_MISMATCH", null, "SCHEMA_MISMATCH");
+  }
+  if (!info || typeof info !== "object" || (info as { service?: unknown }).service !== "c2c-bridge" || (info as { workspaceId?: unknown }).workspaceId !== options.workspaceId) {
+    return failed(infoResponse.status, "SCHEMA_MISMATCH", null, "SCHEMA_MISMATCH");
+  }
+  const infoValue = info as { publicUrl?: unknown; tunnel?: { running?: unknown } };
+  const bridgeInfoTunnelHealth = infoValue.tunnel?.running === false
+    ? "UNHEALTHY"
+    : infoValue.tunnel?.running === true && typeof infoValue.publicUrl === "string" && Boolean(infoValue.publicUrl)
+      ? "HEALTHY"
+      : "UNKNOWN";
+  const bridgeInfoPublicUrl = typeof infoValue.publicUrl === "string" ? infoValue.publicUrl : null;
+
+  let probeResponse: Response;
+  try {
+    probeResponse = await request("/admin/recovery-probe");
+  } catch (error) {
+    const kind = transportErrorKind(error);
+    return { ...failed(infoResponse.status, null, null, kind), bridgeInfoHealthy: true, bridgeInfoTunnelHealth, bridgeInfoPublicUrl };
+  }
+  if (!probeResponse.ok) {
+    const kind = httpErrorKind(probeResponse.status, "probe");
+    return { ...failed(infoResponse.status, null, probeResponse.status, kind), bridgeInfoHealthy: true, bridgeInfoTunnelHealth, bridgeInfoPublicUrl };
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(await probeResponse.text());
+  } catch {
+    return { ...failed(infoResponse.status, null, probeResponse.status, "INVALID_JSON"), bridgeInfoHealthy: true, bridgeInfoTunnelHealth, bridgeInfoPublicUrl };
+  }
+  if (!payload || typeof payload !== "object" ||
+      (payload as { ok?: unknown }).ok !== true ||
+      (payload as { context?: unknown }).context !== "bridge" ||
+      !isExecutionProbe((payload as { probe?: unknown }).probe)) {
+    return { ...failed(infoResponse.status, null, probeResponse.status, "SCHEMA_MISMATCH"), bridgeInfoHealthy: true, bridgeInfoTunnelHealth, bridgeInfoPublicUrl };
+  }
+  return {
+    bridgeInfoHealthy: true,
+    bridgeInfoStatus: infoResponse.status,
+    bridgeInfoErrorKind: null,
+    bridgeInfoTunnelHealth,
+    bridgeInfoPublicUrl,
+    bridgeProbe: (payload as { probe: ExecutionProbe }).probe,
+    bridgeProbeStatus: probeResponse.status,
+    bridgeProbeErrorKind: null,
+  };
+}
 
 export interface ProbeAdapter {
   spawnVersion(executable: string, timeoutMs: number): ProbeStatus;
