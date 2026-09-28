@@ -22,6 +22,64 @@ Follow the returned `state` and `nextAction`; do not infer a different path.
 - If local process creation remains blocked after one capable-context retry,
   report `BLOCKED_LOCAL_EXECUTION` and stop. Do not hand commands to the user.
 
+## Isolated CONTROL bootstrap
+
+CONTROL bootstrap is separate from TARGET/MOZI recovery. For this machine use:
+
+```text
+CONTROL workspace: D:\app_home\codex-with-chatgpt
+CONTROL state: C:\Users\66483\AppData\Local\codex-with-chatgpt\c2c-repair-control-state
+TARGET workspace: D:\workshop\职业教育-MOZI
+TARGET state: D:\app_home\codex-with-chatgpt-state
+```
+
+Set `C2C_STATE_DIR` to the CONTROL state path for every CONTROL helper call and
+pass both TARGET paths as identity guards. Never read or write TARGET session,
+runtime, recovery progress, or Project files from this flow.
+
+Use the hidden `c2c control-bootstrap` helper for local readiness. It performs
+an effective state-directory create/read/delete probe, checks the local process
+probe, verifies an existing Bridge without restarting it, or starts a missing
+Bridge only after process capability is `CAPABLE`. It then requires the Bridge's
+authenticated `/admin/info` and structured `/admin/recovery-probe` to pass.
+It never starts a Tunnel and never reads `config.toml` or edits `writable_roots`.
+For CONTROL only, use this effective probe as the sandbox readiness evidence;
+the generic `doctor.sandbox` exact `writable_roots` result is metadata-only and
+must not override a passing effective probe. Keep all other required doctor
+checks. TARGET recovery retains the existing doctor contract.
+
+When the helper returns `nextAction: RETRY_CAPABLE_CONTEXT`, Codex orchestration
+must invoke that same helper exactly once through the Codex `exec_command` tool
+with `sandbox_permissions: require_escalated` and `--capable-context-retry`.
+Set `C2C_STATE_DIR` to the CONTROL state path in that tool invocation too. This
+is the only context handoff: the CLI does not elevate, call `runas`, or create a
+privileged shell. The helper persists `capableContextAttempted` before probing
+again. If the second probe or Bridge verification fails, surface
+`CONTROL_BOOTSTRAP_BLOCKED` and stop; never retry a second time or ask the user
+to run a command.
+
+The Codex-only invocation form is:
+
+```powershell
+$env:C2C_STATE_DIR = 'C:\Users\66483\AppData\Local\codex-with-chatgpt\c2c-repair-control-state'
+node 'D:\app_home\codex-with-chatgpt\bin\c2c.js' control-bootstrap `
+  --workspace 'D:\app_home\codex-with-chatgpt' `
+  --control-state-dir $env:C2C_STATE_DIR `
+  --target-workspace 'D:\workshop\职业教育-MOZI' `
+  --target-state-dir 'D:\app_home\codex-with-chatgpt-state' --json
+```
+
+Only the single retry adds `--capable-context-retry` and uses the Codex
+execution tool's `require_escalated` setting. Never present this invocation to
+the user as a command to run.
+
+Do not start a Quick Tunnel as part of this helper. Continue to the separate
+public-endpoint approval gate only after `CONTROL_BRIDGE_READY` and all local
+readiness checks pass.
+
+## State machine
+
+```text
 START → LOCAL_DIAGNOSIS
   ├─ verified legacy Bridge (authenticated /admin/info 200 + /admin/recovery-probe 404)
   │    → LEGACY_BRIDGE_PROBE_UNSUPPORTED

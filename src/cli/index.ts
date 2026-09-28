@@ -70,6 +70,12 @@ import {
   readRecoveryProgress,
   writeRecoveryProgress,
 } from "../recovery/state.js";
+import {
+  APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
+  probeControlStateDirectoryWrite,
+  runControlBootstrap,
+  validateControlBootstrapIsolation,
+} from "../control-bootstrap.js";
 
 const program = new Command();
 
@@ -800,6 +806,88 @@ program
             : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
     );
     if (!allOk || namedRepair.needed) process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------- isolated CONTROL bootstrap helpers (internal)
+
+program
+  .command("control-bootstrap", { hidden: true })
+  .description("Probe and prepare the isolated CONTROL Bridge without starting a Tunnel")
+  .requiredOption("--workspace <path>")
+  .requiredOption("--control-state-dir <path>")
+  .requiredOption("--target-workspace <path>")
+  .requiredOption("--target-state-dir <path>")
+  .option("--capable-context-retry", "consume the single Codex-orchestrated capable-context handoff", false)
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: {
+    workspace: string;
+    controlStateDir: string;
+    targetWorkspace: string;
+    targetStateDir: string;
+    capableContextRetry: boolean;
+    json: boolean;
+  }) => {
+    const emptyProbe = { ok: false, created: false, readBack: false, deleted: false };
+    const blocked = (reason: string) => ({
+      ok: false,
+      state: "CONTROL_BOOTSTRAP_BLOCKED",
+      nextAction: "CONTROL_BOOTSTRAP_BLOCKED",
+      capableContextAttempted: false,
+      stateDirectoryWriteProbe: emptyProbe,
+      reason,
+    });
+    const emit = (value: unknown) => {
+      if (opts.json) say(JSON.stringify(value));
+      else say(JSON.stringify(value, null, 2));
+    };
+    try {
+      const isolationError = validateControlBootstrapIsolation({
+        controlWorkspaceRoot: opts.workspace,
+        controlStateDir: opts.controlStateDir,
+        targetWorkspaceRoot: opts.targetWorkspace,
+        targetStateDir: opts.targetStateDir,
+      }, APPROVED_CONTROL_BOOTSTRAP_IDENTITIES);
+      if (isolationError) {
+        emit(blocked(isolationError));
+        return;
+      }
+      const controlRoot = resolveWorkspace(opts.workspace);
+      const expectedStateDir = path.resolve(opts.controlStateDir);
+      const actualStateDir = path.resolve(getStateDir());
+      const statePathsMatch = process.platform === "win32"
+        ? expectedStateDir.toLowerCase() === actualStateDir.toLowerCase()
+        : expectedStateDir === actualStateDir;
+      if (!statePathsMatch) {
+        emit(blocked("CONTROL_STATE_DIR_DOES_NOT_MATCH_C2C_STATE_DIR"));
+        return;
+      }
+
+      const workspace = new Workspace(controlRoot);
+      const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspace.id));
+      const result = await runControlBootstrap({
+        workspaceId: workspace.id,
+        controlWorkspaceRoot: workspace.root,
+        controlStateDir: expectedStateDir,
+        targetWorkspaceRoot: opts.targetWorkspace,
+        targetStateDir: opts.targetStateDir,
+        capableContextRetry: opts.capableContextRetry,
+      }, {
+        approvedIdentities: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
+        stateDirectoryWriteProbe: probeControlStateDirectoryWrite,
+        localProbe: () => probeExecutionContext({ context: "local", cloudflaredPath: profile?.cloudflaredPath }),
+        findBridge: (workspaceId) => findBridgeObservation(workspaceId),
+        startBridge: (workspaceRoot) => ensureBridge(workspaceRoot),
+        bridgeProbe: (runtime, workspaceId) => observeBridgeRecoveryProbe({
+          port: runtime.port,
+          adminToken: runtime.adminToken,
+          workspaceId,
+          timeoutMs: 12_000,
+        }),
+      });
+      emit(result);
+    } catch (error) {
+      emit(blocked(error instanceof Error ? error.message : "CONTROL_BOOTSTRAP_FAILED"));
+    }
   });
 
 // ---------------------------------------------------------------- deterministic recovery helpers (internal)
