@@ -2,10 +2,20 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 
+/** The canonical user-owned Codex metadata root, outside AppData package virtualization. */
+export function canonicalCodexDirectory(homeDirectory = os.homedir()): string {
+  const canonicalHome = fs.realpathSync.native(homeDirectory);
+  return path.join(canonicalHome, ".codex");
+}
+
 /** Stable, user-owned location for the single approved cloudflared binary. */
 export function managedCloudflaredDirectory(homeDirectory = os.homedir()): string {
-  const canonicalHome = fs.realpathSync.native(homeDirectory);
-  return path.join(canonicalHome, ".codex", "cloudflared");
+  return path.join(canonicalCodexDirectory(homeDirectory), "cloudflared");
+}
+
+/** Fixed canonical CONTROL state location; never derives from AppData or caller state. */
+export function canonicalControlStateDirectory(homeDirectory = os.homedir()): string {
+  return path.join(canonicalCodexDirectory(homeDirectory), "c2c-repair-control-state");
 }
 
 /**

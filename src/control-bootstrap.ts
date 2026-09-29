@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { getStateDir, managedCloudflaredDirectory, readJsonIfExists, writeSecureJson } from "./config/paths.js";
+import { canonicalCodexDirectory, canonicalControlStateDirectory, getStateDir, managedCloudflaredDirectory, readJsonIfExists, writeSecureJson } from "./config/paths.js";
 import { networkProfileFile } from "./config/network-profile.js";
 import type { BridgeObservation, RuntimeState } from "./bridge/runtime.js";
 import { classifyProbe, type ExecutionProbe } from "./recovery/harness.js";
@@ -66,7 +66,7 @@ export interface ControlBootstrapIdentities {
 
 export const APPROVED_CONTROL_BOOTSTRAP_IDENTITIES: Readonly<ControlBootstrapIdentities> = Object.freeze({
   controlWorkspaceRoot: "D:\\app_home\\codex-with-chatgpt",
-  controlStateDir: "C:\\Users\\66483\\AppData\\Local\\codex-with-chatgpt\\c2c-repair-control-state",
+  controlStateDir: canonicalControlStateDirectory(),
   targetWorkspaceRoot: "D:\\workshop\\职业教育-MOZI",
   targetStateDir: "D:\\app_home\\codex-with-chatgpt-state",
 });
@@ -221,15 +221,28 @@ function canonicalExistingPath(value: string): string | null {
   }
 }
 
-/** Resolve CONTROL state without creating its production directory during validation. */
-function canonicalControlStatePath(value: string): string | null {
+/** Resolve only the approved CONTROL state path without creating it during validation. */
+function canonicalControlStatePath(value: string, approvedPath: string): string | null {
   if (!path.win32.isAbsolute(value) || hasDotSegments(value) ||
-      path.win32.basename(value).toLowerCase() !== "c2c-repair-control-state") return null;
+      path.win32.basename(value).toLowerCase() !== "c2c-repair-control-state" ||
+      !sameCanonical(normalizeWindowsPath(value), normalizeWindowsPath(approvedPath))) return null;
   try {
-    const parent = normalizeWindowsPath(fs.realpathSync.native(path.win32.dirname(value)));
-    const canonicalChild = path.win32.join(parent, "c2c-repair-control-state");
-    if (fs.existsSync(value) && !sameCanonical(normalizeWindowsPath(fs.realpathSync.native(value)), canonicalChild)) return null;
-    return path.win32.normalize(canonicalChild);
+    const expectedParent = normalizeWindowsPath(path.win32.dirname(approvedPath));
+    if (fs.existsSync(expectedParent)) {
+      const realParent = normalizeWindowsPath(fs.realpathSync.native(expectedParent));
+      if (!sameCanonical(realParent, expectedParent)) return null;
+    } else if (!sameCanonical(normalizeWindowsPath(approvedPath), normalizeWindowsPath(canonicalControlStateDirectory()))) {
+      // A test-injected root must already have a real parent. Production may
+      // create its canonical .codex parent during the subsequent write probe.
+      return null;
+    } else {
+      // Even before .codex exists, bind its expected parent to the real home.
+      const expectedCodexParent = normalizeWindowsPath(canonicalCodexDirectory());
+      if (!sameCanonical(expectedParent, expectedCodexParent)) return null;
+    }
+    const canonicalState = normalizeWindowsPath(approvedPath);
+    if (fs.existsSync(value) && !sameCanonical(normalizeWindowsPath(fs.realpathSync.native(value)), canonicalState)) return null;
+    return path.win32.normalize(canonicalState);
   } catch {
     return null;
   }
@@ -244,14 +257,14 @@ export function validateControlBootstrapIsolation(
   input: Pick<ControlBootstrapInput, keyof ControlBootstrapIdentities>,
   approved: Readonly<ControlBootstrapIdentities> = APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
 ): string | null {
-  const candidates = [
-    [input.controlWorkspaceRoot, approved.controlWorkspaceRoot, canonicalExistingPath],
-    [input.controlStateDir, approved.controlStateDir, canonicalControlStatePath],
-    [input.targetWorkspaceRoot, approved.targetWorkspaceRoot, canonicalExistingPath],
-    [input.targetStateDir, approved.targetStateDir, canonicalExistingPath],
-  ] as const;
-  for (const [candidate, expected, resolvePath] of candidates) {
-    if (!sameCanonical(resolvePath(candidate), resolvePath(expected))) return "CONTROL_IDENTITY_MISMATCH";
+  const candidates: Array<{ candidate: string; expected: string; resolve: (candidate: string, expected: string) => string | null }> = [
+    { candidate: input.controlWorkspaceRoot, expected: approved.controlWorkspaceRoot, resolve: (value) => canonicalExistingPath(value) },
+    { candidate: input.controlStateDir, expected: approved.controlStateDir, resolve: canonicalControlStatePath },
+    { candidate: input.targetWorkspaceRoot, expected: approved.targetWorkspaceRoot, resolve: (value) => canonicalExistingPath(value) },
+    { candidate: input.targetStateDir, expected: approved.targetStateDir, resolve: (value) => canonicalExistingPath(value) },
+  ];
+  for (const { candidate, expected, resolve } of candidates) {
+    if (!sameCanonical(resolve(candidate, expected), resolve(expected, expected))) return "CONTROL_IDENTITY_MISMATCH";
   }
   return null;
 }
@@ -435,7 +448,7 @@ export async function runControlBootstrap(
   }
   if (progress && (
     !sameCanonical(canonicalExistingPath(progress.controlWorkspaceRoot), canonicalExistingPath(input.controlWorkspaceRoot)) ||
-    !sameCanonical(canonicalControlStatePath(progress.controlStateDir), canonicalControlStatePath(input.controlStateDir))
+    !sameCanonical(canonicalControlStatePath(progress.controlStateDir, input.controlStateDir), canonicalControlStatePath(input.controlStateDir, input.controlStateDir))
   )) return resultBlocked(stateDirectoryWriteProbe, progress.capableContextAttempted, "CONTROL_BOOTSTRAP_IDENTITY_MISMATCH");
   if (progress?.state === "CONTROL_BOOTSTRAP_BLOCKED") {
     return resultBlocked(stateDirectoryWriteProbe, progress.capableContextAttempted, progress.reason ?? "CONTROL_BOOTSTRAP_ALREADY_BLOCKED");

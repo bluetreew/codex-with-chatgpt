@@ -22,7 +22,7 @@ import {
   type ControlBootstrapInput,
   type StateDirectoryWriteProbe,
 } from "../src/control-bootstrap.js";
-import { managedCloudflaredDirectory } from "../src/config/paths.js";
+import { canonicalCodexDirectory, canonicalControlStateDirectory, managedCloudflaredDirectory } from "../src/config/paths.js";
 import {
   inspectLegacyControlRuntime,
   parseLegacyProcessProbeResult,
@@ -203,10 +203,38 @@ describe("CONTROL bootstrap capable execution handoff", () => {
   it("pins the production canonical identities to the approved CONTROL and TARGET paths", () => {
     expect(APPROVED_CONTROL_BOOTSTRAP_IDENTITIES).toEqual({
       controlWorkspaceRoot: "D:\\app_home\\codex-with-chatgpt",
-      controlStateDir: "C:\\Users\\66483\\AppData\\Local\\codex-with-chatgpt\\c2c-repair-control-state",
+      controlStateDir: canonicalControlStateDirectory(),
       targetWorkspaceRoot: "D:\\workshop\\职业教育-MOZI",
       targetStateDir: "D:\\app_home\\codex-with-chatgpt-state",
     });
+  });
+
+  it("derives the canonical CONTROL state only from the canonical home .codex root", () => {
+    const { root, homeDirectory } = fixture();
+    const secondHome = path.join(root, "different-home");
+    fs.mkdirSync(secondHome, { recursive: true });
+    const firstRealHome = fs.realpathSync.native(homeDirectory);
+    const secondRealHome = fs.realpathSync.native(secondHome);
+    expect(canonicalControlStateDirectory(homeDirectory)).toBe(path.join(firstRealHome, ".codex", "c2c-repair-control-state"));
+    expect(canonicalControlStateDirectory(secondHome)).toBe(path.join(secondRealHome, ".codex", "c2c-repair-control-state"));
+    expect(canonicalControlStateDirectory()).toBe(path.join(fs.realpathSync.native(os.homedir()), ".codex", "c2c-repair-control-state"));
+    expect(APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir).toBe(canonicalControlStateDirectory());
+    expect(fs.existsSync(canonicalControlStateDirectory())).toBe(false);
+  });
+
+  it("rejects the deprecated AppData path and package LocalCache as canonical CONTROL state", () => {
+    const production = APPROVED_CONTROL_BOOTSTRAP_IDENTITIES;
+    const userHome = fs.realpathSync.native(os.homedir());
+    const appData = {
+      ...production,
+      controlStateDir: path.join(userHome, "AppData", "Local", "codex-with-chatgpt", "c2c-repair-control-state"),
+    };
+    const packageCache = {
+      ...production,
+      controlStateDir: path.join(userHome, "AppData", "Local", "Packages", "OpenAI.Codex_test", "LocalCache", "Local", "codex-with-chatgpt", "c2c-repair-control-state"),
+    };
+    expect(validateControlBootstrapIsolation(appData)).toBe("CONTROL_IDENTITY_MISMATCH");
+    expect(validateControlBootstrapIsolation(packageCache)).toBe("CONTROL_IDENTITY_MISMATCH");
   });
 
   it("accepts canonical fixture identities and a case-only Windows spelling without creating CONTROL state", () => {
@@ -256,6 +284,18 @@ describe("CONTROL bootstrap capable execution handoff", () => {
     fs.mkdirSync(different);
     fs.symlinkSync(different, alias, "junction");
     expect(validateControlBootstrapIsolation({ ...input, controlWorkspaceRoot: alias }, approvedIdentities))
+      .toBe("CONTROL_IDENTITY_MISMATCH");
+  });
+
+  it.skipIf(!junctionFixtureSupported)("rejects a CONTROL state root whose .codex parent is redirected", () => {
+    const { input, approvedIdentities, root } = fixture();
+    const redirected = path.join(root, "redirected-codex");
+    const target = path.join(root, "outside-codex");
+    fs.mkdirSync(target);
+    fs.symlinkSync(target, redirected, "junction");
+    const escapedState = path.join(redirected, "c2c-repair-control-state");
+    const identities = { ...approvedIdentities, controlStateDir: escapedState };
+    expect(validateControlBootstrapIsolation({ ...input, controlStateDir: escapedState }, identities))
       .toBe("CONTROL_IDENTITY_MISMATCH");
   });
 
@@ -584,6 +624,28 @@ describe("CONTROL bootstrap capable execution handoff", () => {
 });
 
 describe("fresh-state CONTROL CLI cloudflared resolver wiring", () => {
+  it("realpaths a disposable state-root sibling under the actual user-home .codex without creating production state", () => {
+    const codexRoot = canonicalCodexDirectory();
+    const canonicalCodexRoot = fs.realpathSync.native(codexRoot);
+    const productionState = canonicalControlStateDirectory();
+    const productionStateExistedBefore = fs.existsSync(productionState);
+    expect(canonicalCodexRoot.toLowerCase()).toBe(path.resolve(codexRoot).toLowerCase());
+
+    const fixtureDirectory = fs.mkdtempSync(path.join(canonicalCodexRoot, "c2c-control-state-fixture-"));
+    try {
+      const child = path.join(fixtureDirectory, "fixture-child");
+      fs.writeFileSync(child, "fixture", { flag: "wx" });
+      const canonicalFixture = fs.realpathSync.native(fixtureDirectory);
+      const canonicalChild = fs.realpathSync.native(child);
+      expect(canonicalFixture.startsWith(`${canonicalCodexRoot}${path.sep}`)).toBe(true);
+      expect(canonicalChild.startsWith(`${canonicalCodexRoot}${path.sep}`)).toBe(true);
+      expect(canonicalChild.toLowerCase()).not.toContain("\\appdata\\local\\packages\\");
+    } finally {
+      fs.rmSync(fixtureDirectory, { recursive: true, force: true });
+    }
+    expect(fs.existsSync(productionState)).toBe(productionStateExistedBefore);
+  });
+
   it("derives the sole managed root from the canonical user home", () => {
     const { homeDirectory, managedDirectory } = fixture();
     expect(managedCloudflaredDirectory(homeDirectory)).toBe(managedDirectory);

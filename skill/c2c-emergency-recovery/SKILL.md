@@ -28,7 +28,7 @@ CONTROL bootstrap is separate from TARGET/MOZI recovery. For this machine use:
 
 ```text
 CONTROL workspace: D:\app_home\codex-with-chatgpt
-CONTROL state: C:\Users\66483\AppData\Local\codex-with-chatgpt\c2c-repair-control-state
+CONTROL state: <canonical user home>\.codex\c2c-repair-control-state
 TARGET workspace: D:\workshop\职业教育-MOZI
 TARGET state: D:\app_home\codex-with-chatgpt-state
 ```
@@ -61,7 +61,8 @@ to run a command.
 The Codex-only invocation form is:
 
 ```powershell
-$env:C2C_STATE_DIR = 'C:\Users\66483\AppData\Local\codex-with-chatgpt\c2c-repair-control-state'
+$canonicalHome = [Environment]::GetFolderPath('UserProfile')
+$env:C2C_STATE_DIR = Join-Path (Join-Path $canonicalHome '.codex') 'c2c-repair-control-state'
 node 'D:\app_home\codex-with-chatgpt\bin\c2c.js' control-bootstrap `
   --workspace 'D:\app_home\codex-with-chatgpt' `
   --control-state-dir $env:C2C_STATE_DIR `
