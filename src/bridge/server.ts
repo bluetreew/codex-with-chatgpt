@@ -13,22 +13,24 @@ import { CloudflaredNamedTunnel } from "../tunnel/cloudflared-named.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
 import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { Logger, nullLogger } from "../logger/index.js";
-import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
+import { DEFAULT_HOST, DEFAULT_PORT, managedCloudflaredDirectory } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
-import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { clearRuntimeState, createRuntimeState, queryProcessCreatedAt, writeRuntimeState } from "./runtime.js";
 import { probeExecutionContext } from "../recovery/probe.js";
 import type { ExecutionProbe } from "../recovery/harness.js";
+import { isApprovedControlWorkspaceRoot } from "../control-bootstrap.js";
 
-function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
+function tunnelForWorkspace(workspaceId: string, logger: Logger, managedCloudflaredDirectory?: string): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
   if (binding) {
     return new CloudflaredNamedTunnel({
       tunnelName: binding.tunnelName,
       hostname: binding.hostname,
       logger,
+      managedCloudflaredDirectory,
     });
   }
-  return new CloudflaredQuickTunnel(logger);
+  return new CloudflaredQuickTunnel(logger, undefined, { managedCloudflaredDirectory });
 }
 
 export interface BridgeOptions {
@@ -86,6 +88,9 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
+  const controlManagedCloudflaredDirectory = isApprovedControlWorkspaceRoot(workspace.root)
+    ? managedCloudflaredDirectory()
+    : undefined;
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
@@ -93,7 +98,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   const authStore = new AuthStore(workspace.id, { file: opts.authStoreFile });
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
-  const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
+  const tunnel = controlManagedCloudflaredDirectory
+    ? tunnelForWorkspace(workspace.id, logger, controlManagedCloudflaredDirectory)
+    : opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
 
   let publicBaseUrl: string | null = null;
@@ -183,7 +190,11 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       const tunnelDoctor = await tunnel.doctor();
       const probe = opts.recoveryProbe
         ? await opts.recoveryProbe()
-        : await probeExecutionContext({ context: "bridge", cloudflaredPath: tunnelDoctor.binaryPath });
+        : await probeExecutionContext({
+          context: "bridge",
+          cloudflaredPath: tunnelDoctor.binaryPath,
+          ...(controlManagedCloudflaredDirectory ? { managedCloudflaredDirectory: controlManagedCloudflaredDirectory } : {}),
+        });
       res.json({ ok: true, context: "bridge", probe });
     } catch {
       res.status(500).json({ ok: false, context: "bridge", error: "recovery_probe_failed" });
@@ -226,24 +237,24 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }, 100);
   });
 
+  const processCreatedAt = queryProcessCreatedAt(process.pid);
   const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
-  const startedAt = new Date().toISOString();
+  const runtimeState = createRuntimeState({
+    service: SERVICE_NAME,
+    version: VERSION,
+    workspaceId: workspace.id,
+    workspaceRoot: workspace.root,
+    pid: process.pid,
+    port,
+    adminToken,
+    publicUrl: publicBaseUrl,
+  }, processCreatedAt);
+  const { startedAt } = runtimeState;
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
   const persistRuntime = (): void => {
     if (opts.persistRuntime === false) return;
-    const state: RuntimeState = {
-      service: SERVICE_NAME,
-      version: VERSION,
-      workspaceId: workspace.id,
-      workspaceRoot: workspace.root,
-      pid: process.pid,
-      port,
-      adminToken,
-      publicUrl: publicBaseUrl,
-      startedAt,
-    };
-    writeRuntimeState(state);
+    writeRuntimeState({ ...runtimeState, publicUrl: publicBaseUrl });
   };
   persistRuntime();
 

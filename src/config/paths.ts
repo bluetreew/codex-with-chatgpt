@@ -2,6 +2,12 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 
+/** Stable, user-owned location for the single approved cloudflared binary. */
+export function managedCloudflaredDirectory(homeDirectory = os.homedir()): string {
+  const canonicalHome = fs.realpathSync.native(homeDirectory);
+  return path.join(canonicalHome, ".codex", "cloudflared");
+}
+
 /**
  * State directory resolution, following OS conventions.
  * Override with C2C_STATE_DIR (used heavily by tests).

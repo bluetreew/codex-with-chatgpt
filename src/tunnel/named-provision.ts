@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { findBinary } from "./detect.js";
+import { resolveApprovedCloudflaredPath } from "../recovery/probe.js";
 import { suggestedNamedHostname } from "./hostname.js";
 import { normalizeNamedTunnelHostname } from "./cloudflared-named.js";
 import {
@@ -80,16 +80,14 @@ export function isBenignRouteError(message: string): boolean {
 }
 
 export class ProcessCloudflaredAccount implements CloudflaredAccount {
-  constructor(private readonly binaryOverride?: string) {}
+  constructor(private readonly executablePath: string) {
+    if (!executablePath || !path.isAbsolute(executablePath)) {
+      throw new Error("An explicitly resolved absolute cloudflared executable is required");
+    }
+  }
 
   private binary(): string {
-    const bin = this.binaryOverride ?? findBinary("cloudflared");
-    if (!bin) {
-      throw new Error(
-        "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
-      );
-    }
-    return bin;
+    return this.executablePath;
   }
 
   hasCert(): boolean {
@@ -184,14 +182,34 @@ export interface ProvisionNamedResult {
   error?: string;
 }
 
+export type NamedProvisionExecutableResult =
+  | { status: "PASS"; path: string }
+  | { status: "NOT_CONFIGURED" }
+  | { status: "UNAPPROVED_CLOUDFLARED_PATH" };
+
+/** Select a named-provision binary explicitly at the caller boundary. CONTROL ignores discovery entirely. */
+export function resolveNamedProvisionExecutable(options: {
+  controlWorkspace: boolean;
+  managedCloudflaredDirectory?: string;
+  discoveredExecutable?: string | null;
+}): NamedProvisionExecutableResult {
+  if (options.controlWorkspace) {
+    if (!options.managedCloudflaredDirectory) return { status: "NOT_CONFIGURED" };
+    return resolveApprovedCloudflaredPath(undefined, options.managedCloudflaredDirectory);
+  }
+  return typeof options.discoveredExecutable === "string" && path.isAbsolute(options.discoveredExecutable)
+    ? { status: "PASS", path: options.discoveredExecutable }
+    : { status: "NOT_CONFIGURED" };
+}
+
 export async function provisionNamedTunnel(opts: {
   workspaceId: string;
   workspaceName: string;
   zone: string;
   hostname?: string;
-  account?: CloudflaredAccount;
+  account: CloudflaredAccount;
 }): Promise<ProvisionNamedResult> {
-  const account = opts.account ?? new ProcessCloudflaredAccount();
+  const account = opts.account;
   let hostname: string;
   try {
     hostname = opts.hostname

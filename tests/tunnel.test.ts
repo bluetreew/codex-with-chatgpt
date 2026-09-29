@@ -1,6 +1,7 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, afterAll, beforeAll, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { findBinary } from "../src/tunnel/detect.js";
@@ -16,7 +17,9 @@ import {
   isBenignRouteError,
   parseCreatedTunnel,
   parseTunnelList,
+  ProcessCloudflaredAccount,
   provisionNamedTunnel,
+  resolveNamedProvisionExecutable,
   type CloudflaredAccount,
 } from "../src/tunnel/named-provision.js";
 import { resolveTunnelProtocol, tunnelProtocolArgs } from "../src/tunnel/protocol.js";
@@ -26,6 +29,9 @@ import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 const stateDirs: string[] = [];
 const previousStateDir = process.env.C2C_STATE_DIR;
 const previousCloudflaredPath = process.env.C2C_CLOUDFLARED_PATH;
+const previousPath = process.env.PATH;
+let namedProvisionFixtureRoot = "";
+let namedProvisionCandidate = "";
 const QUICK_URL = "https://random-words-here-1234.trycloudflare.com";
 type FetchImpl = NonNullable<CloudflaredQuickTunnelOptions["fetchImpl"]>;
 
@@ -67,6 +73,23 @@ afterEach(() => {
   else process.env.C2C_STATE_DIR = previousStateDir;
   if (previousCloudflaredPath === undefined) delete process.env.C2C_CLOUDFLARED_PATH;
   else process.env.C2C_CLOUDFLARED_PATH = previousCloudflaredPath;
+  if (previousPath === undefined) delete process.env.PATH;
+  else process.env.PATH = previousPath;
+});
+
+beforeAll(() => {
+  namedProvisionFixtureRoot = makeTmpDir("named-control-untrusted-path");
+  const filename = process.platform === "win32" ? "cloudflared.exe" : "cloudflared";
+  namedProvisionCandidate = path.join(namedProvisionFixtureRoot, filename);
+  if (process.platform === "win32") fs.copyFileSync(process.execPath, namedProvisionCandidate);
+  else {
+    fs.writeFileSync(namedProvisionCandidate, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    fs.chmodSync(namedProvisionCandidate, 0o755);
+  }
+});
+
+afterAll(() => {
+  if (namedProvisionFixtureRoot) cleanup(namedProvisionFixtureRoot);
 });
 
 describe("findBinary", () => {
@@ -78,6 +101,69 @@ describe("findBinary", () => {
     if (process.platform !== "win32") fs.chmodSync(configured, 0o755);
     process.env.C2C_CLOUDFLARED_PATH = configured;
     expect(findBinary("cloudflared")).toBe(configured);
+  });
+});
+
+describe("CONTROL managed tunnel executable", () => {
+  it("uses only the approved managed-root binary and ignores PATH/env candidates", async () => {
+    const home = makeTmpDir("cloudflared-managed-home");
+    stateDirs.push(home);
+    const managed = path.join(home, ".codex", "cloudflared");
+    fs.mkdirSync(managed, { recursive: true });
+    const approved = write(managed, "cloudflared.exe", "fixture");
+    const untrusted = write(home, "cloudflared.exe", "untrusted");
+    process.env.C2C_CLOUDFLARED_PATH = untrusted;
+    const tunnel = new CloudflaredQuickTunnel(undefined, undefined, { managedCloudflaredDirectory: managed });
+    await expect(tunnel.doctor()).resolves.toMatchObject({ binaryFound: true, binaryPath: fs.realpathSync(approved) });
+
+    const missingManaged = path.join(home, ".codex", "missing-cloudflared");
+    const blocked = new CloudflaredQuickTunnel(undefined, undefined, { managedCloudflaredDirectory: missingManaged });
+    await expect(blocked.doctor()).resolves.toMatchObject({ binaryFound: false, binaryPath: null });
+  });
+
+  it.each(["PATH", "C2C_CLOUDFLARED_PATH"] as const)("ignores unapproved %s discovery for CONTROL named provisioning", (source) => {
+    const managed = path.join(namedProvisionFixtureRoot, "home", ".codex", "cloudflared");
+    if (source === "PATH") {
+      process.env.C2C_CLOUDFLARED_PATH = "";
+      process.env.PATH = namedProvisionFixtureRoot;
+    } else {
+      process.env.C2C_CLOUDFLARED_PATH = namedProvisionCandidate;
+      process.env.PATH = "";
+    }
+    const discoveredExecutable = findBinary("cloudflared");
+    expect(discoveredExecutable).not.toBeNull();
+    const result = resolveNamedProvisionExecutable({
+      controlWorkspace: true,
+      managedCloudflaredDirectory: managed,
+      discoveredExecutable,
+    });
+    expect(result.status).toBe("NOT_CONFIGURED");
+  });
+
+  it("selects only the exact approved managed executable for CONTROL named provisioning", () => {
+    const root = makeTmpDir("named-control-approved");
+    stateDirs.push(root);
+    const managed = path.join(root, "home", ".codex", "cloudflared");
+    fs.mkdirSync(managed, { recursive: true });
+    const approved = write(managed, "cloudflared.exe", "fixture");
+    const untrusted = write(root, "outside.exe", "outside fixture");
+    expect(resolveNamedProvisionExecutable({
+      controlWorkspace: true,
+      managedCloudflaredDirectory: managed,
+      discoveredExecutable: untrusted,
+    })).toEqual({ status: "PASS", path: fs.realpathSync.native(approved) });
+  });
+
+  it("preserves explicit discovery for non-CONTROL named provisioning", () => {
+    expect(resolveNamedProvisionExecutable({
+      controlWorkspace: false,
+      discoveredExecutable: "C:\\tools\\cloudflared.exe",
+    })).toEqual({ status: "PASS", path: "C:\\tools\\cloudflared.exe" });
+  });
+
+  it("requires ProcessCloudflaredAccount callers to provide the selected executable", () => {
+    expect(() => new ProcessCloudflaredAccount("")).toThrow(/executable/i);
+    expect(() => new ProcessCloudflaredAccount(undefined as unknown as string)).toThrow(/executable/i);
   });
 });
 

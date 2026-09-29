@@ -8,6 +8,7 @@ import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { SERVICE_NAME } from "../version.js";
 import { findBinary } from "./detect.js";
+import { resolveApprovedCloudflaredPath } from "../recovery/probe.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
 import { tunnelProtocolArgs } from "./protocol.js";
 
@@ -80,6 +81,8 @@ export interface CloudflaredQuickTunnelOptions {
     options: { stdio: ["ignore", "pipe", "pipe"]; windowsHide: true; env?: NodeJS.ProcessEnv }
   ) => ChildProcess;
   fetchImpl?: (input: string | URL, init?: RequestInit) => Promise<Response>;
+  /** When set, disable PATH/profile discovery and use only this approved root. */
+  managedCloudflaredDirectory?: string;
 }
 
 /**
@@ -97,6 +100,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
   private readonly spawnImpl: NonNullable<CloudflaredQuickTunnelOptions["spawnImpl"]>;
   private readonly fetchImpl: NonNullable<CloudflaredQuickTunnelOptions["fetchImpl"]>;
   private readonly useEnvironmentProxy: boolean;
+  private readonly managedCloudflaredDirectory?: string;
   private starting: Promise<string> | null = null;
   private cancelStart: (() => void) | null = null;
   private relay: ChildProcess | null = null;
@@ -114,9 +118,14 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
     this.spawnImpl = options.spawnImpl ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
     this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
     this.useEnvironmentProxy = options.fetchImpl === undefined;
+    this.managedCloudflaredDirectory = options.managedCloudflaredDirectory;
   }
 
   private binary(): string | null {
+    if (this.managedCloudflaredDirectory) {
+      const approved = resolveApprovedCloudflaredPath(undefined, this.managedCloudflaredDirectory);
+      return approved.status === "PASS" ? approved.path : null;
+    }
     return this.binaryOverride ?? findBinary("cloudflared");
   }
 

@@ -3,8 +3,10 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { startBridge } from "../src/bridge/server.js";
 import {
+  createRuntimeState,
   findBridgeObservation,
   findLiveBridge,
+  queryProcessCreatedAt,
   writeRuntimeState,
   type RuntimeState,
 } from "../src/bridge/runtime.js";
@@ -12,6 +14,51 @@ import { ensureBridge } from "../src/process/daemon.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
+
+describe("runtime process creation provenance", () => {
+  const runtimeFields = {
+    service: SERVICE_NAME,
+    version: VERSION,
+    workspaceId: "workspace-fixture",
+    workspaceRoot: "D:\\workspace-fixture",
+    pid: 4321,
+    port: 48765,
+    adminToken: "fixture-admin-token",
+    publicUrl: null,
+  };
+
+  it("records OS process creation time separately from later Bridge readiness", () => {
+    const processCreatedAt = queryProcessCreatedAt(4321, {
+      platform: "win32",
+      systemRoot: "C:\\Windows",
+      run: (command, args, script) => {
+        expect(command).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        expect(args[0]).toBe("-NoProfile");
+        expect(script).toContain("ProcessId = $processId");
+        expect(script).toContain("$process.CreationDate");
+        expect(script).not.toContain("Date.now");
+        expect(script).not.toContain("process.uptime");
+        return { status: 0, stdout: "2025-01-01T00:00:00.000Z\r\n" };
+      },
+    });
+    const runtime = createRuntimeState(runtimeFields, processCreatedAt, new Date("2025-01-01T00:00:03.000Z"));
+
+    expect(runtime.processCreatedAt).toBe("2025-01-01T00:00:00.000Z");
+    expect(runtime.startedAt).toBe("2025-01-01T00:00:03.000Z");
+    expect(Date.parse(runtime.startedAt)).toBeGreaterThan(Date.parse(runtime.processCreatedAt!));
+  });
+
+  it("does not invent process provenance when the OS query fails", () => {
+    expect(queryProcessCreatedAt(4321, {
+      platform: "win32",
+      run: () => ({ status: null, stdout: "", error: { code: "ETIMEDOUT" } }),
+    })).toBeNull();
+
+    const runtime = createRuntimeState(runtimeFields, null, new Date("2025-01-01T00:00:03.000Z"));
+    expect(runtime.processCreatedAt).toBeNull();
+    expect(runtime.startedAt).toBe("2025-01-01T00:00:03.000Z");
+  });
+});
 
 function stubRuntime(workspaceId: string, workspaceRoot: string, pid: number, port: number): RuntimeState {
   return {

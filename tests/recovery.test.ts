@@ -1082,7 +1082,8 @@ describe("safe process probe and recovery planning", () => {
   it("probes the default C2C-managed cloudflared path when no network-profile path is supplied", async () => {
     const stateDir = isolateStateDir();
     tempDirs.push(stateDir);
-    const managed = path.join(path.dirname(stateDir), "cloudflared");
+    const managed = path.join(path.dirname(stateDir), "user-home", ".codex", "cloudflared");
+    fs.mkdirSync(path.dirname(managed), { recursive: true });
     fs.mkdirSync(managed, { recursive: true });
     const approved = write(managed, "cloudflared.exe", "fixture");
     const probed: string[] = [];
@@ -1090,7 +1091,7 @@ describe("safe process probe and recovery planning", () => {
       spawnVersion: (executable) => { probed.push(executable); return "PASS"; },
       forkRelay: async () => "PASS",
     };
-    const result = await probeExecutionContext({ context: "local", adapter });
+    const result = await probeExecutionContext({ context: "local", adapter, managedCloudflaredDirectory: managed });
     expect(result.cloudflaredSpawn).toBe("PASS");
     expect(probed).toContain(fs.realpathSync(approved));
   });

@@ -88,13 +88,14 @@ describe("Windows background subprocess windowsHide: true (RED verification)", (
   });
 
   it("5. ProcessCloudflaredAccount.run in src/tunnel/named-provision.ts passes windowsHide: true", async () => {
-    const account = new ProcessCloudflaredAccount("fake-cloudflared");
+    const executable = path.resolve("fake-cloudflared");
+    const account = new ProcessCloudflaredAccount(executable);
     try {
       await account.listTunnels();
     } catch {
       // Expected to fail execution, but spawnSync should record call
     }
-    const provisionCall = spawnSyncCalls.find((c) => c.file === "fake-cloudflared");
+    const provisionCall = spawnSyncCalls.find((c) => c.file === executable);
     expect(provisionCall).toBeDefined();
     expect(provisionCall?.options).toHaveProperty("windowsHide", true);
   });

@@ -2,7 +2,7 @@ import { fork, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getStateDir } from "../config/paths.js";
+import { managedCloudflaredDirectory } from "../config/paths.js";
 import { classifyProbe, type BridgeContext, type BridgeProbeErrorKind, type ExecutionProbe, type ProbeStatus } from "./harness.js";
 
 export interface BridgeProbeObservation {
@@ -163,7 +163,7 @@ function statusFromError(error: unknown): ProbeStatus {
 
 export function resolveApprovedCloudflaredPath(
   candidate: unknown,
-  managedDirectory = path.join(path.dirname(getStateDir()), "cloudflared")
+  managedDirectory = managedCloudflaredDirectory()
 ): { status: "PASS"; path: string } | { status: "NOT_CONFIGURED" | "UNAPPROVED_CLOUDFLARED_PATH" } {
   try {
     const requestedManagedRoot = path.resolve(managedDirectory);

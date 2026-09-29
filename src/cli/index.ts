@@ -4,16 +4,18 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
+import { reconcileLegacyControlRuntime } from "../bridge/legacy-control-runtime.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
-import { detectTunnelBinaries } from "../tunnel/detect.js";
+import { detectTunnelBinaries, findBinary } from "../tunnel/detect.js";
 import {
   chooseQuickTunnel,
   hasCloudflaredCert,
   ProcessCloudflaredAccount,
   provisionNamedTunnel,
+  resolveNamedProvisionExecutable,
 } from "../tunnel/named-provision.js";
 import { parseZoneInput, suggestedNamedHostname } from "../tunnel/hostname.js";
 import {
@@ -25,7 +27,7 @@ import {
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
-import { getStateDir, readJsonIfExists } from "../config/paths.js";
+import { getStateDir, managedCloudflaredDirectory, readJsonIfExists } from "../config/paths.js";
 import { networkProfileFile, readNetworkProfile, writeNetworkProfile } from "../config/network-profile.js";
 import { ProxyAgent, fetch as proxyFetch } from "undici";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
@@ -75,6 +77,8 @@ import {
   createControlBootstrapCliAdapter,
   probeControlStateDirectoryWrite,
   runControlBootstrap,
+  isApprovedControlWorkspaceRoot,
+  resolveTunnelPrecheckCloudflared,
   validateControlBootstrapIsolation,
 } from "../control-bootstrap.js";
 
@@ -88,6 +92,22 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+function cloudflaredAccountForWorkspace(workspaceRoot: string): ProcessCloudflaredAccount {
+  const controlWorkspace = isApprovedControlWorkspaceRoot(workspaceRoot);
+  const executable = resolveNamedProvisionExecutable({
+    controlWorkspace,
+    ...(controlWorkspace ? { managedCloudflaredDirectory: managedCloudflaredDirectory() } : {}),
+    ...(controlWorkspace ? {} : { discoveredExecutable: findBinary("cloudflared") }),
+  });
+  if (executable.status === "NOT_CONFIGURED") {
+    throw new Error("NEED_CLOUDFLARED: no executable is available in the approved location");
+  }
+  if (executable.status === "UNAPPROVED_CLOUDFLARED_PATH") {
+    throw new Error("UNAPPROVED_CLOUDFLARED_PATH: named provisioning requires the approved managed executable");
+  }
+  return new ProcessCloudflaredAccount(executable.path);
 }
 
 async function waitForProcessExit(pid: number, timeoutMs = 10_000): Promise<boolean> {
@@ -236,8 +256,12 @@ async function ensureBridgeAndTunnel(
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
   if (opts.tunnel && !info.publicUrl) {
     const profile = readNetworkProfile(info.workspaceId);
-    const binary = profile?.cloudflaredPath && fs.existsSync(profile.cloudflaredPath)
-      ? profile.cloudflaredPath : detectTunnelBinaries().cloudflared;
+    const binary = resolveTunnelPrecheckCloudflared({
+      workspaceRoot,
+      profileCandidate: profile?.cloudflaredPath,
+      managedCloudflaredDirectory: managedCloudflaredDirectory(),
+      discoverGeneric: () => detectTunnelBinaries().cloudflared,
+    });
     if (!binary) {
       throw new Error(
         "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
@@ -320,8 +344,9 @@ program
   .option("--port <port>", "preferred port")
   .action(async (opts: { workspace: string; port?: string }) => {
     const logger = new Logger({ name: "bridge", console: true });
+    const workspaceRoot = resolveWorkspace(opts.workspace);
     const bridge = await startBridge({
-      workspaceRoot: resolveWorkspace(opts.workspace),
+      workspaceRoot,
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       logger,
     });
@@ -675,8 +700,12 @@ program
 
       if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running)) {
         try {
-          const binary = networkProfile?.cloudflaredPath && fs.existsSync(networkProfile.cloudflaredPath)
-            ? networkProfile.cloudflaredPath : detectTunnelBinaries().cloudflared;
+          const binary = resolveTunnelPrecheckCloudflared({
+            workspaceRoot: root,
+            profileCandidate: networkProfile?.cloudflaredPath,
+            managedCloudflaredDirectory: managedCloudflaredDirectory(),
+            discoverGeneric: () => detectTunnelBinaries().cloudflared,
+          });
           if (!binary) {
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
@@ -882,6 +911,7 @@ program
           workspaceId,
           timeoutMs: 12_000,
         }),
+        reconcileLegacyRuntime: (identity) => reconcileLegacyControlRuntime(identity),
       }));
       emit(result);
     } catch (error) {
@@ -1784,6 +1814,7 @@ tunnelCmd
         workspaceName: workspace.name,
         zone,
         hostname: opts.hostname,
+        account: cloudflaredAccountForWorkspace(workspace.root),
       });
       if (await findLiveBridge(workspace.id)) await stopBridge(root);
       const payload = {
@@ -1805,16 +1836,15 @@ tunnelCmd
     }
   });
 
-acceptUnusedWorkspaceOption(
-  tunnelCmd
-    .command("login")
-    .description("Open the Cloudflare login window used by a named hostname")
-    .option("--json", "machine-readable output", false)
-)
-  .action(async (opts: { json: boolean }) => {
+tunnelCmd
+  .command("login")
+  .description("Open the Cloudflare login window used by a named hostname")
+  .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { json: boolean; workspace?: string }) => {
     try {
       if (!opts.json) say(NAMED_LOGIN_PROMPT);
-      const account = new ProcessCloudflaredAccount();
+      const account = cloudflaredAccountForWorkspace(resolveWorkspace(opts.workspace));
       await account.login();
       const payload = { ok: true, loggedIn: hasCloudflaredCert() };
       if (opts.json) say(JSON.stringify(payload));

@@ -1,12 +1,13 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { getStateDir, readJsonIfExists, writeSecureJson } from "./config/paths.js";
+import { getStateDir, managedCloudflaredDirectory, readJsonIfExists, writeSecureJson } from "./config/paths.js";
 import { networkProfileFile } from "./config/network-profile.js";
 import type { BridgeObservation, RuntimeState } from "./bridge/runtime.js";
 import { classifyProbe, type ExecutionProbe } from "./recovery/harness.js";
 import { probeExecutionContext, resolveApprovedCloudflaredPath, type BridgeProbeObservation, type ProbeAdapter } from "./recovery/probe.js";
 import { discoverBinaryCandidates } from "./tunnel/detect.js";
+import type { LegacyRuntimeReconciliation } from "./bridge/legacy-control-runtime.js";
 
 export type ControlBootstrapState =
   | "CONTROL_CAPABLE_CONTEXT_REQUIRED"
@@ -30,6 +31,7 @@ export interface ControlBootstrapProgress {
   state: ControlBootstrapState;
   capableContextAttempted: boolean;
   updatedAt: string;
+  legacyRuntimeDisposition?: "NONE" | "STALE" | "RETIRED";
   reason?: string;
 }
 
@@ -42,6 +44,7 @@ export interface ControlBootstrapResult {
   localProbe?: ExecutionProbe;
   bridgeStatus?: BridgeObservation["state"];
   bridgeProbe?: BridgeProbeObservation;
+  legacyRuntimeDisposition?: "NONE" | "STALE" | "RETIRED";
   reason?: string;
 }
 
@@ -75,6 +78,7 @@ export interface ControlBootstrapAdapter {
   findBridge(workspaceId: string): Promise<BridgeObservation>;
   startBridge(workspaceRoot: string): Promise<{ runtime: RuntimeState; spawned: boolean }>;
   bridgeProbe(runtime: RuntimeState, workspaceId: string): Promise<BridgeProbeObservation>;
+  reconcileLegacyRuntime(input: { workspaceId: string; workspaceRoot: string; controlStateDirectory: string }): Promise<LegacyRuntimeReconciliation>;
 }
 
 export interface ControlBootstrapCloudflaredResolution {
@@ -87,14 +91,17 @@ export interface ControlBootstrapCloudflaredResolution {
 export interface ControlBootstrapProbeOptions {
   environment?: NodeJS.ProcessEnv;
   probeAdapter?: ProbeAdapter;
+  /** Test seam; production derives this only from the canonical user home. */
+  managedCloudflaredDirectory?: string;
 }
 
 /** Discover candidates without executing them; only the existing managed-root validator can approve one. */
 export function resolveControlBootstrapCloudflared(
   profileCandidate: unknown,
   environment: NodeJS.ProcessEnv = process.env,
+  approvedManagedDirectory = managedCloudflaredDirectory(),
 ): ControlBootstrapCloudflaredResolution {
-  const managedDirectory = path.join(path.dirname(getStateDir()), "cloudflared");
+  const managedDirectory = approvedManagedDirectory;
   if (profileCandidate !== undefined && profileCandidate !== null && profileCandidate !== "") {
     const approved = resolveApprovedCloudflaredPath(profileCandidate, managedDirectory);
     return {
@@ -128,13 +135,44 @@ export function resolveControlBootstrapCloudflared(
   return { managedDirectory, status: "NOT_CONFIGURED", source: "none" };
 }
 
+/**
+ * Resolve a cloudflared availability precheck without executing an untrusted
+ * candidate. CONTROL uses the same managed-root resolver as its local probe;
+ * generic discovery is retained only for non-CONTROL workspaces.
+ */
+export function resolveTunnelPrecheckCloudflared(options: {
+  workspaceRoot: string;
+  profileCandidate: unknown;
+  managedCloudflaredDirectory?: string;
+  environment?: NodeJS.ProcessEnv;
+  discoverGeneric: () => string | null;
+}): string | null {
+  if (isApprovedControlWorkspaceRoot(options.workspaceRoot)) {
+    const resolved = resolveControlBootstrapCloudflared(
+      options.profileCandidate,
+      options.environment ?? process.env,
+      options.managedCloudflaredDirectory ?? managedCloudflaredDirectory(),
+    );
+    return resolved.status === "PASS" ? resolved.candidate ?? null : null;
+  }
+
+  if (typeof options.profileCandidate === "string" && fs.existsSync(options.profileCandidate)) {
+    return options.profileCandidate;
+  }
+  return options.discoverGeneric();
+}
+
 /** Production CLI probe wiring: profile read → safe discovery → trust validation → execution probe. */
 export async function probeControlBootstrapLocalExecution(
   workspaceId: string,
   options: ControlBootstrapProbeOptions = {},
 ): Promise<ExecutionProbe> {
   const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspaceId));
-  const resolved = resolveControlBootstrapCloudflared(profile?.cloudflaredPath, options.environment ?? process.env);
+  const resolved = resolveControlBootstrapCloudflared(
+    profile?.cloudflaredPath,
+    options.environment ?? process.env,
+    options.managedCloudflaredDirectory ?? managedCloudflaredDirectory(),
+  );
   const base = await probeExecutionContext({
     context: "local",
     cloudflaredPath: resolved.candidate,
@@ -218,6 +256,11 @@ export function validateControlBootstrapIsolation(
   return null;
 }
 
+/** Identify only the fixed CONTROL workspace; never infer it from state or caller metadata. */
+export function isApprovedControlWorkspaceRoot(value: string): boolean {
+  return sameCanonical(canonicalExistingPath(value), canonicalExistingPath(APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot));
+}
+
 export function controlBootstrapProgressFile(stateDir: string, workspaceId: string): string {
   const safeId = encodeURIComponent(workspaceId).replaceAll("%", "_");
   return path.join(stateDir, "control-bootstrap", `${safeId}.json`);
@@ -267,7 +310,8 @@ export function readControlBootstrapProgress(stateDir: string, workspaceId: stri
   if (progress.schemaVersion !== 1 || progress.workspaceId !== workspaceId ||
       typeof progress.controlWorkspaceRoot !== "string" || typeof progress.controlStateDir !== "string" ||
       !states.includes(progress.state as ControlBootstrapState) ||
-      typeof progress.capableContextAttempted !== "boolean" || typeof progress.updatedAt !== "string") {
+      typeof progress.capableContextAttempted !== "boolean" || typeof progress.updatedAt !== "string" ||
+      (progress.legacyRuntimeDisposition !== undefined && !["NONE", "STALE", "RETIRED"].includes(progress.legacyRuntimeDisposition))) {
     throw new Error("CONTROL_BOOTSTRAP_PROGRESS_INVALID");
   }
   return progress as ControlBootstrapProgress;
@@ -337,7 +381,13 @@ function resultBlocked(
   };
 }
 
-function progressFor(input: ControlBootstrapInput, state: ControlBootstrapState, attempted: boolean, reason?: string): ControlBootstrapProgress {
+function progressFor(
+  input: ControlBootstrapInput,
+  state: ControlBootstrapState,
+  attempted: boolean,
+  reason?: string,
+  legacyRuntimeDisposition?: "NONE" | "STALE" | "RETIRED",
+): ControlBootstrapProgress {
   return {
     schemaVersion: 1,
     workspaceId: input.workspaceId,
@@ -346,6 +396,7 @@ function progressFor(input: ControlBootstrapInput, state: ControlBootstrapState,
     state,
     capableContextAttempted: attempted,
     updatedAt: new Date().toISOString(),
+    ...(legacyRuntimeDisposition ? { legacyRuntimeDisposition } : {}),
     ...(reason ? { reason } : {}),
   };
 }
@@ -455,6 +506,31 @@ export async function runControlBootstrap(
 
   let runtime: RuntimeState;
   let finalBridgeStatus: BridgeObservation["state"] = observation.state;
+  let legacyRuntimeDisposition: "NONE" | "STALE" | "RETIRED" | undefined;
+  if (observation.state === "stopped") {
+    let reconciliation: LegacyRuntimeReconciliation;
+    try {
+      reconciliation = await adapter.reconcileLegacyRuntime({
+        workspaceId: input.workspaceId,
+        workspaceRoot: input.controlWorkspaceRoot,
+        controlStateDirectory: input.controlStateDir,
+      });
+    } catch {
+      reconciliation = { disposition: "CONFLICT", reason: "CONTROL_RUNTIME_IDENTITY_CONFLICT" };
+    }
+    if (reconciliation.disposition === "CONFLICT" || reconciliation.disposition === "BLOCKED") {
+      const result = resultBlocked(stateDirectoryWriteProbe, progress?.capableContextAttempted ?? false, reconciliation.reason, localProbe, observation.state);
+      persistBlocked(input, result.capableContextAttempted, result.reason!);
+      return result;
+    }
+    legacyRuntimeDisposition = reconciliation.disposition;
+    const postReconciliationIdentityError = validateControlBootstrapIsolation(input, adapter.approvedIdentities);
+    if (postReconciliationIdentityError) {
+      const result = resultBlocked(stateDirectoryWriteProbe, progress?.capableContextAttempted ?? false, postReconciliationIdentityError, localProbe, observation.state);
+      persistBlocked(input, result.capableContextAttempted, result.reason!);
+      return result;
+    }
+  }
   if (observation.state === "healthy") {
     runtime = observation.runtime;
   } else {
@@ -492,7 +568,7 @@ export async function runControlBootstrap(
   }
 
   const attempted = progress?.capableContextAttempted ?? false;
-  try { writeControlBootstrapProgress(input.controlStateDir, progressFor(input, "CONTROL_BRIDGE_READY", attempted)); }
+  try { writeControlBootstrapProgress(input.controlStateDir, progressFor(input, "CONTROL_BRIDGE_READY", attempted, undefined, legacyRuntimeDisposition)); }
   catch { return resultBlocked(stateDirectoryWriteProbe, attempted, "CONTROL_BOOTSTRAP_PROGRESS_WRITE_FAILED", localProbe, finalBridgeStatus, bridgeProbe); }
   return {
     ok: true,
@@ -503,5 +579,6 @@ export async function runControlBootstrap(
     localProbe,
     bridgeStatus: finalBridgeStatus,
     bridgeProbe,
+    ...(legacyRuntimeDisposition ? { legacyRuntimeDisposition } : {}),
   };
 }
