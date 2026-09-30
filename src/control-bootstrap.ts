@@ -8,6 +8,8 @@ import { classifyProbe, type ExecutionProbe } from "./recovery/harness.js";
 import { probeExecutionContext, resolveApprovedCloudflaredPath, type BridgeProbeObservation, type ProbeAdapter } from "./recovery/probe.js";
 import { discoverBinaryCandidates } from "./tunnel/detect.js";
 import type { LegacyRuntimeReconciliation } from "./bridge/legacy-control-runtime.js";
+import { workspaceIdFromCanonicalRoot } from "./workspace/manager.js";
+import type { ResolvedControlTargetProfile } from "./control-target-profile.js";
 
 export type ControlBootstrapState =
   | "CONTROL_CAPABLE_CONTEXT_REQUIRED"
@@ -52,27 +54,23 @@ export interface ControlBootstrapInput {
   workspaceId: string;
   controlWorkspaceRoot: string;
   controlStateDir: string;
-  targetWorkspaceRoot: string;
-  targetStateDir: string;
+  targetProfile: ResolvedControlTargetProfile;
   capableContextRetry: boolean;
 }
 
 export interface ControlBootstrapIdentities {
   controlWorkspaceRoot: string;
   controlStateDir: string;
-  targetWorkspaceRoot: string;
-  targetStateDir: string;
 }
 
 export const APPROVED_CONTROL_BOOTSTRAP_IDENTITIES: Readonly<ControlBootstrapIdentities> = Object.freeze({
   controlWorkspaceRoot: "D:\\app_home\\codex-with-chatgpt",
   controlStateDir: canonicalControlStateDirectory(),
-  targetWorkspaceRoot: "D:\\workshop\\职业教育-MOZI",
-  targetStateDir: "D:\\app_home\\codex-with-chatgpt-state",
 });
 
 export interface ControlBootstrapAdapter {
   approvedIdentities: Readonly<ControlBootstrapIdentities>;
+  approvedTargetProfile: Readonly<ResolvedControlTargetProfile>;
   stateDirectoryWriteProbe(stateDir: string): StateDirectoryWriteProbe;
   localProbe(): Promise<ExecutionProbe>;
   findBridge(workspaceId: string): Promise<BridgeObservation>;
@@ -254,20 +252,43 @@ function sameCanonical(left: string | null, right: string | null): boolean {
   return left !== null && right !== null && left.toLowerCase() === right.toLowerCase();
 }
 
-/** Validate all four identities without creating state or opening TARGET files. */
-export function validateControlBootstrapIsolation(
-  input: Pick<ControlBootstrapInput, keyof ControlBootstrapIdentities>,
+/** Validate CONTROL's own identity before inspecting any target profile. */
+export function validateControlBootstrapControlIdentity(
+  input: Pick<ControlBootstrapInput, "controlWorkspaceRoot" | "controlStateDir">,
   approved: Readonly<ControlBootstrapIdentities> = APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
 ): string | null {
   const candidates: Array<{ candidate: string; expected: string; resolve: (candidate: string, expected: string) => string | null }> = [
     { candidate: input.controlWorkspaceRoot, expected: approved.controlWorkspaceRoot, resolve: (value) => canonicalExistingPath(value) },
     { candidate: input.controlStateDir, expected: approved.controlStateDir, resolve: canonicalControlStatePath },
-    { candidate: input.targetWorkspaceRoot, expected: approved.targetWorkspaceRoot, resolve: (value) => canonicalExistingPath(value) },
-    { candidate: input.targetStateDir, expected: approved.targetStateDir, resolve: (value) => canonicalExistingPath(value) },
   ];
   for (const { candidate, expected, resolve } of candidates) {
     if (!sameCanonical(resolve(candidate, expected), resolve(expected, expected))) return "CONTROL_IDENTITY_MISMATCH";
   }
+  return null;
+}
+
+/** Validate CONTROL identity and a resolver-produced TARGET profile without side effects. */
+export function validateControlBootstrapIsolation(
+  input: Pick<ControlBootstrapInput, "controlWorkspaceRoot" | "controlStateDir" | "targetProfile">,
+  approved: Readonly<ControlBootstrapIdentities>,
+  approvedTargetProfile: Readonly<ResolvedControlTargetProfile>,
+): string | null {
+  const controlIdentityError = validateControlBootstrapControlIdentity(input, approved);
+  if (controlIdentityError) return controlIdentityError;
+
+  const profile = input.targetProfile;
+  if (!profile || profile.schemaVersion !== approvedTargetProfile.schemaVersion ||
+      profile.profileId !== approvedTargetProfile.profileId ||
+      profile.expectedWorkspaceId !== approvedTargetProfile.expectedWorkspaceId ||
+      profile.workspaceId !== approvedTargetProfile.workspaceId ||
+      profile.workspaceId !== profile.expectedWorkspaceId) {
+    return "CONTROL_IDENTITY_MISMATCH";
+  }
+  const profileWorkspaceRoot = canonicalExistingPath(profile.targetWorkspaceRoot);
+  const approvedWorkspaceRoot = canonicalExistingPath(approvedTargetProfile.targetWorkspaceRoot);
+  if (!sameCanonical(profileWorkspaceRoot, approvedWorkspaceRoot) ||
+      !sameCanonical(path.resolve(profile.targetStateDir), path.resolve(approvedTargetProfile.targetStateDir)) ||
+      !profileWorkspaceRoot || workspaceIdFromCanonicalRoot(profileWorkspaceRoot) !== profile.expectedWorkspaceId) return "CONTROL_IDENTITY_MISMATCH";
   return null;
 }
 
@@ -425,7 +446,7 @@ export async function runControlBootstrap(
   input: ControlBootstrapInput,
   adapter: ControlBootstrapAdapter,
 ): Promise<ControlBootstrapResult> {
-  const isolationError = validateControlBootstrapIsolation(input, adapter.approvedIdentities);
+  const isolationError = validateControlBootstrapIsolation(input, adapter.approvedIdentities, adapter.approvedTargetProfile);
   const emptyProbe: StateDirectoryWriteProbe = { ok: false, created: false, readBack: false, deleted: false };
   if (isolationError) return resultBlocked(emptyProbe, false, isolationError);
 
@@ -577,7 +598,7 @@ export async function runControlBootstrap(
       return result;
     }
     legacyRuntimeDisposition = reconciliation.disposition;
-    const postReconciliationIdentityError = validateControlBootstrapIsolation(input, adapter.approvedIdentities);
+    const postReconciliationIdentityError = validateControlBootstrapIsolation(input, adapter.approvedIdentities, adapter.approvedTargetProfile);
     if (postReconciliationIdentityError) {
       const result = resultBlocked(stateDirectoryWriteProbe, progress?.capableContextAttempted ?? false, postReconciliationIdentityError, localProbe, observation.state);
       persistBlocked(input, result.capableContextAttempted, result.reason!);

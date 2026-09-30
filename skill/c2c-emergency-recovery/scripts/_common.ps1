@@ -1,20 +1,13 @@
 param(
-    [string]$WorkspacePath = (Get-Location).Path,
+    [Parameter(Mandatory = $true)][string]$TargetProfile,
+    [string]$WorkspacePath = "",
     [string]$StateDir = "",
     [string]$C2cJs = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-if ([string]::IsNullOrWhiteSpace($WorkspacePath)) { throw "WorkspacePath cannot be empty." }
-$WorkspacePath = (Resolve-Path -LiteralPath $WorkspacePath).Path
-
-if ([string]::IsNullOrWhiteSpace($StateDir)) {
-    if (-not [string]::IsNullOrWhiteSpace($env:C2C_STATE_DIR)) { $StateDir = $env:C2C_STATE_DIR }
-    elseif (Test-Path -LiteralPath "D:\app_home\codex-with-chatgpt-state") { $StateDir = "D:\app_home\codex-with-chatgpt-state" }
-}
-if ([string]::IsNullOrWhiteSpace($StateDir)) { throw "C2C state directory is unresolved." }
-$env:C2C_STATE_DIR = $StateDir
+if ([string]::IsNullOrWhiteSpace($TargetProfile)) { throw "TargetProfile cannot be empty." }
 
 if ([string]::IsNullOrWhiteSpace($C2cJs)) {
     if (-not [string]::IsNullOrWhiteSpace($env:C2C_CLI_JS)) { $C2cJs = $env:C2C_CLI_JS }
@@ -26,6 +19,38 @@ if ([string]::IsNullOrWhiteSpace($C2cJs) -or -not (Test-Path -LiteralPath $C2cJs
 
 $script:NodeExe = (Get-Command node -ErrorAction Stop).Source
 $script:C2cCommand = (Resolve-Path -LiteralPath $C2cJs).Path
+
+$previousResolveWorkspace = $env:C2C_PROFILE_RESOLVE_WORKSPACE
+$previousResolveState = $env:C2C_PROFILE_RESOLVE_STATE
+$env:C2C_PROFILE_RESOLVE_WORKSPACE = $WorkspacePath
+$env:C2C_PROFILE_RESOLVE_STATE = $StateDir
+$resolvedLines = & $script:NodeExe $script:C2cCommand 'control-target' 'resolve' '--profile' $TargetProfile '--json'
+$resolveExitCode = $LASTEXITCODE
+$env:C2C_PROFILE_RESOLVE_WORKSPACE = $previousResolveWorkspace
+$env:C2C_PROFILE_RESOLVE_STATE = $previousResolveState
+$resolvedText = ($resolvedLines -join [Environment]::NewLine).Trim()
+if ($resolveExitCode -ne 0) { throw "Target profile resolution failed ($resolveExitCode): $resolvedText" }
+$resolvedTarget = $resolvedText | ConvertFrom-Json
+if ($resolvedTarget.ok -ne $true -or -not $resolvedTarget.profile) { throw "Target profile resolution failed closed." }
+$profileWorkspace = (Resolve-Path -LiteralPath $resolvedTarget.profile.targetWorkspaceRoot).Path
+$profileState = [System.IO.Path]::GetFullPath([string]$resolvedTarget.profile.targetStateDir)
+if (-not [string]::IsNullOrWhiteSpace($WorkspacePath)) {
+    $requestedWorkspace = (Resolve-Path -LiteralPath $WorkspacePath).Path
+    if (-not [string]::Equals($requestedWorkspace, $profileWorkspace, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "RECOVERY_TARGET_BINDING_MISMATCH: WorkspacePath differs from TargetProfile."
+    }
+}
+if (-not [string]::IsNullOrWhiteSpace($StateDir)) {
+    $requestedState = [System.IO.Path]::GetFullPath($StateDir)
+    if (-not [string]::Equals($requestedState, $profileState, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "RECOVERY_TARGET_BINDING_MISMATCH: StateDir differs from TargetProfile."
+    }
+}
+$WorkspacePath = $profileWorkspace
+$StateDir = $profileState
+$script:TargetProfile = $resolvedTarget.profile.profileId
+$env:C2C_RECOVERY_WORKSPACE_ID = $resolvedTarget.profile.workspaceId
+$env:C2C_STATE_DIR = $StateDir
 
 function Invoke-C2C {
     param([Parameter(Mandatory = $true)][string[]]$C2CArgs)

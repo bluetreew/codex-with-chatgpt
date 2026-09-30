@@ -1,13 +1,14 @@
 param(
     [Parameter(Mandatory = $true)][ValidateSet('AI_CONFIRM_CONNECTOR')][string]$RecoveryState,
+    [Parameter(Mandatory = $true)][string]$TargetProfile,
     [Parameter(Mandatory = $true)][string]$ConnectorName,
     [Parameter(Mandatory = $true)][string]$McpUrl,
-    [string]$WorkspacePath = (Get-Location).Path,
+    [string]$WorkspacePath = "",
     [string]$StateDir = "",
     [string]$C2cJs = ""
 )
 
-. "$PSScriptRoot\_common.ps1" -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs
+. "$PSScriptRoot\_common.ps1" -TargetProfile $TargetProfile -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs
 
 $statusScript = Join-Path $PSScriptRoot 'c2c-status.ps1'
 $before = $null
@@ -16,7 +17,7 @@ $sessionNameChanged = $false
 $endpointConfirmationSucceeded = $false
 $rollbackSucceeded = $true
 try {
-    $preflight = (& $statusScript -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs -RecoveryState $RecoveryState -TransitionEvent 'CONNECTOR_CONFIRM_REQUESTED' -RequestedMcpUrl $McpUrl -ActualConnectorName $ConnectorName | ConvertFrom-Json)
+    $preflight = (& $statusScript -TargetProfile $TargetProfile -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs -RecoveryState $RecoveryState -TransitionEvent 'CONNECTOR_CONFIRM_REQUESTED' -RequestedMcpUrl $McpUrl -ActualConnectorName $ConnectorName | ConvertFrom-Json)
     if ($preflight.state -ne 'CONFIRMING_CONNECTOR') {
         [ordered]@{ ok = $false; state = 'INVALID_RECOVERY_TRANSITION'; nextAction = 'INVALID_RECOVERY_TRANSITION' } | ConvertTo-Json -Compress
         return
@@ -48,7 +49,7 @@ try {
     }
     $endpointConfirmed = $confirmed.mcpUrl -eq $McpUrl -and $doctor.chatgptRepair.needed -ne $true
     $transitionEvent = if (-not $metadataPreserved) { 'SESSION_PRESERVATION_FAILED' } elseif ($endpointConfirmed -and $nameUpdated -and $localPass) { 'CONNECTOR_CONFIRMED' } else { 'CONNECTOR_CONFIRMATION_FAILED' }
-    $transition = (& $statusScript -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs -RecoveryState $preflight.state -TransitionEvent $transitionEvent -ActualConnectorName $after.session.connectorName -ConnectorConfirmed:$($transitionEvent -eq 'CONNECTOR_CONFIRMED') | ConvertFrom-Json)
+    $transition = (& $statusScript -TargetProfile $TargetProfile -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs -RecoveryState $preflight.state -TransitionEvent $transitionEvent -ActualConnectorName $after.session.connectorName -ConnectorConfirmed:$($transitionEvent -eq 'CONNECTOR_CONFIRMED') | ConvertFrom-Json)
     $ok = $endpointConfirmed -and $metadataPreserved -and $nameUpdated -and $localPass -and $transition.state -eq 'POST_RECOVERY_VERIFY'
     [ordered]@{
         ok = $ok
@@ -76,7 +77,7 @@ catch {
         }
         try {
             $failureEvent = if (-not $rollbackSucceeded) { 'SESSION_PRESERVATION_FAILED' } else { 'CONNECTOR_CONFIRMATION_FAILED' }
-            $failed = (& $statusScript -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs -RecoveryState $preflight.state -TransitionEvent $failureEvent | ConvertFrom-Json)
+            $failed = (& $statusScript -TargetProfile $TargetProfile -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs -RecoveryState $preflight.state -TransitionEvent $failureEvent | ConvertFrom-Json)
             $terminalState = $failed.state
         }
         catch { $terminalState = 'LOCAL_RECOVERY_FAILED' }

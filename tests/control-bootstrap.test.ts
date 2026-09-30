@@ -30,6 +30,8 @@ import {
 } from "../src/bridge/legacy-control-runtime.js";
 import type { ExecutionProbe } from "../src/recovery/harness.js";
 import { resolveApprovedCloudflaredPath, type BridgeProbeObservation, type ProbeAdapter } from "../src/recovery/probe.js";
+import { MOZI_CONTROL_TARGET_PROFILE, type ControlTargetProfile, type ResolvedControlTargetProfile } from "../src/control-target-profile.js";
+import { Workspace } from "../src/workspace/manager.js";
 
 const roots: string[] = [];
 
@@ -58,18 +60,24 @@ function fixture() {
   fs.mkdirSync(targetWorkspaceRoot, { recursive: true });
   fs.mkdirSync(targetStateDir, { recursive: true });
   fs.mkdirSync(homeDirectory, { recursive: true });
+  const targetWorkspaceId = new Workspace(targetWorkspaceRoot).id;
+  const targetProfile: ResolvedControlTargetProfile = {
+    schemaVersion: 1,
+    profileId: "fixture-target",
+    targetWorkspaceRoot,
+    targetStateDir,
+    expectedWorkspaceId: targetWorkspaceId,
+    workspaceId: targetWorkspaceId,
+  };
   const approvedIdentities: ControlBootstrapIdentities = {
     controlWorkspaceRoot,
     controlStateDir,
-    targetWorkspaceRoot,
-    targetStateDir,
   };
   const input: ControlBootstrapInput = {
     workspaceId: "control-workspace-id",
     controlWorkspaceRoot,
     controlStateDir,
-    targetWorkspaceRoot,
-    targetStateDir,
+    targetProfile,
     capableContextRetry: false,
   };
   return { root, input, approvedIdentities, homeDirectory, managedDirectory: path.join(homeDirectory, ".codex", "cloudflared") };
@@ -136,6 +144,7 @@ function adapter(input: ControlBootstrapInput, overrides: {
   observation?: BridgeObservation;
   bridgeProbe?: BridgeProbeObservation;
   approvedIdentities?: ControlBootstrapIdentities;
+  approvedTargetProfile?: ResolvedControlTargetProfile;
   legacyRuntime?:
     | { disposition: "NONE" | "STALE" | "RETIRED" }
     | { disposition: "CONFLICT"; reason: "CONTROL_RUNTIME_IDENTITY_CONFLICT" | "LEGACY_RUNTIME_CREATION_PROVENANCE_MISSING" }
@@ -147,9 +156,8 @@ function adapter(input: ControlBootstrapInput, overrides: {
     approvedIdentities: overrides.approvedIdentities ?? {
       controlWorkspaceRoot: input.controlWorkspaceRoot,
       controlStateDir: input.controlStateDir,
-      targetWorkspaceRoot: input.targetWorkspaceRoot,
-      targetStateDir: input.targetStateDir,
     },
+    approvedTargetProfile: overrides.approvedTargetProfile ?? input.targetProfile,
     stateDirectoryWriteProbe: vi.fn(() => overrides.writeProbe ?? probeControlStateDirectoryWrite(input.controlStateDir)),
     localProbe: vi.fn(async () => localProbes[Math.min(localIndex++, localProbes.length - 1)]),
     findBridge: vi.fn(async () => overrides.observation ?? healthyObservation(input)),
@@ -200,12 +208,17 @@ afterEach(() => {
 });
 
 describe("CONTROL bootstrap capable execution handoff", () => {
-  it("pins the production canonical identities to the approved CONTROL and TARGET paths", () => {
+  it("keeps the production CONTROL identity separate from the MOZI compatibility profile", () => {
     expect(APPROVED_CONTROL_BOOTSTRAP_IDENTITIES).toEqual({
       controlWorkspaceRoot: "D:\\app_home\\codex-with-chatgpt",
       controlStateDir: canonicalControlStateDirectory(),
+    });
+    expect(MOZI_CONTROL_TARGET_PROFILE).toEqual({
+      schemaVersion: 1,
+      profileId: "mozi",
       targetWorkspaceRoot: "D:\\workshop\\职业教育-MOZI",
       targetStateDir: "D:\\app_home\\codex-with-chatgpt-state",
+      expectedWorkspaceId: "8b01a8558a23",
     });
   });
 
@@ -219,11 +232,13 @@ describe("CONTROL bootstrap capable execution handoff", () => {
     expect(canonicalControlStateDirectory(secondHome)).toBe(path.join(secondRealHome, ".codex", "c2c-repair-control-state"));
     expect(canonicalControlStateDirectory()).toBe(path.join(fs.realpathSync.native(os.homedir()), ".codex", "c2c-repair-control-state"));
     expect(APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir).toBe(canonicalControlStateDirectory());
-    expect(fs.existsSync(canonicalControlStateDirectory())).toBe(false);
+    expect(fs.existsSync(path.join(firstRealHome, ".codex", "c2c-repair-control-state"))).toBe(false);
+    expect(fs.existsSync(path.join(secondRealHome, ".codex", "c2c-repair-control-state"))).toBe(false);
   });
 
   it("rejects the deprecated AppData path and package LocalCache as canonical CONTROL state", () => {
     const production = APPROVED_CONTROL_BOOTSTRAP_IDENTITIES;
+    const { input } = fixture();
     const userHome = fs.realpathSync.native(os.homedir());
     const appData = {
       ...production,
@@ -233,33 +248,59 @@ describe("CONTROL bootstrap capable execution handoff", () => {
       ...production,
       controlStateDir: path.join(userHome, "AppData", "Local", "Packages", "OpenAI.Codex_test", "LocalCache", "Local", "codex-with-chatgpt", "c2c-repair-control-state"),
     };
-    expect(validateControlBootstrapIsolation(appData)).toBe("CONTROL_IDENTITY_MISMATCH");
-    expect(validateControlBootstrapIsolation(packageCache)).toBe("CONTROL_IDENTITY_MISMATCH");
+    expect(validateControlBootstrapIsolation({ ...input, controlStateDir: appData.controlStateDir }, production, input.targetProfile))
+      .toBe("CONTROL_IDENTITY_MISMATCH");
+    expect(validateControlBootstrapIsolation({ ...input, controlStateDir: packageCache.controlStateDir }, production, input.targetProfile))
+      .toBe("CONTROL_IDENTITY_MISMATCH");
   });
 
   it("accepts canonical fixture identities and a case-only Windows spelling without creating CONTROL state", () => {
     const { input, approvedIdentities } = fixture();
-    expect(validateControlBootstrapIsolation(input, approvedIdentities)).toBeNull();
+    expect(validateControlBootstrapIsolation(input, approvedIdentities, input.targetProfile)).toBeNull();
     const caseOnly = {
       ...input,
       controlWorkspaceRoot: input.controlWorkspaceRoot.toUpperCase(),
       controlStateDir: input.controlStateDir.toUpperCase(),
-      targetWorkspaceRoot: input.targetWorkspaceRoot.toUpperCase(),
-      targetStateDir: input.targetStateDir.toUpperCase(),
+      targetProfile: {
+        ...input.targetProfile,
+        targetWorkspaceRoot: input.targetProfile.targetWorkspaceRoot.toUpperCase(),
+        targetStateDir: input.targetProfile.targetStateDir.toUpperCase(),
+      },
     };
-    expect(validateControlBootstrapIsolation(caseOnly, approvedIdentities)).toBeNull();
+    expect(validateControlBootstrapIsolation(caseOnly, approvedIdentities, input.targetProfile)).toBeNull();
     expect(fs.existsSync(approvedIdentities.controlStateDir)).toBe(false);
+  });
+
+  it("rejects a profile whose expected workspace id does not match its canonical root", () => {
+    const { input, approvedIdentities } = fixture();
+    const wrongIdProfile = { ...input.targetProfile, expectedWorkspaceId: "000000000000", workspaceId: "000000000000" };
+    expect(validateControlBootstrapIsolation({ ...input, targetProfile: wrongIdProfile }, approvedIdentities, wrongIdProfile))
+      .toBe("CONTROL_IDENTITY_MISMATCH");
   });
 
   it.each([
     "controlWorkspaceRoot",
     "controlStateDir",
+    "targetProfileId",
     "targetWorkspaceRoot",
     "targetStateDir",
+    "targetWorkspaceId",
   ] as const)("rejects an overridden canonical identity (%s) before any mutation", async (key) => {
     const { input, root, approvedIdentities } = fixture();
-    const changed = { ...input, [key]: path.join(root, "attacker-selected") };
-    const deps = adapter(changed, { approvedIdentities });
+    const changed = {
+      ...input,
+      controlWorkspaceRoot: key === "controlWorkspaceRoot" ? path.join(root, "attacker-selected") : input.controlWorkspaceRoot,
+      controlStateDir: key === "controlStateDir" ? path.join(root, "attacker-selected") : input.controlStateDir,
+      targetProfile: {
+        ...input.targetProfile,
+        profileId: key === "targetProfileId" ? "unregistered-profile" : input.targetProfile.profileId,
+        targetWorkspaceRoot: key === "targetWorkspaceRoot" ? path.join(root, "attacker-selected") : input.targetProfile.targetWorkspaceRoot,
+        targetStateDir: key === "targetStateDir" ? path.join(root, "attacker-selected") : input.targetProfile.targetStateDir,
+        expectedWorkspaceId: key === "targetWorkspaceId" ? "caller-controlled-id" : input.targetProfile.expectedWorkspaceId,
+        workspaceId: key === "targetWorkspaceId" ? "caller-controlled-id" : input.targetProfile.workspaceId,
+      },
+    };
+    const deps = adapter(changed, { approvedIdentities, approvedTargetProfile: input.targetProfile });
     const result = await runControlBootstrap(changed, deps);
     expect(result).toMatchObject({ state: "CONTROL_BOOTSTRAP_BLOCKED", reason: "CONTROL_IDENTITY_MISMATCH" });
     expect(deps.stateDirectoryWriteProbe).not.toHaveBeenCalled();
@@ -272,8 +313,8 @@ describe("CONTROL bootstrap capable execution handoff", () => {
     const { input, approvedIdentities, root } = fixture();
     const traversal = { ...input, controlWorkspaceRoot: `${root}\\extra\\..\\codex-with-chatgpt` };
     const alternateState = { ...input, controlStateDir: path.join(root, "other", "c2c-repair-control-state") };
-    expect(validateControlBootstrapIsolation(traversal, approvedIdentities)).toBe("CONTROL_IDENTITY_MISMATCH");
-    expect(validateControlBootstrapIsolation(alternateState, approvedIdentities)).toBe("CONTROL_IDENTITY_MISMATCH");
+    expect(validateControlBootstrapIsolation(traversal, approvedIdentities, input.targetProfile)).toBe("CONTROL_IDENTITY_MISMATCH");
+    expect(validateControlBootstrapIsolation(alternateState, approvedIdentities, input.targetProfile)).toBe("CONTROL_IDENTITY_MISMATCH");
     expect(fs.existsSync(alternateState.controlStateDir)).toBe(false);
   });
 
@@ -283,7 +324,7 @@ describe("CONTROL bootstrap capable execution handoff", () => {
     const different = path.join(root, "different-workspace");
     fs.mkdirSync(different);
     fs.symlinkSync(different, alias, "junction");
-    expect(validateControlBootstrapIsolation({ ...input, controlWorkspaceRoot: alias }, approvedIdentities))
+    expect(validateControlBootstrapIsolation({ ...input, controlWorkspaceRoot: alias }, approvedIdentities, input.targetProfile))
       .toBe("CONTROL_IDENTITY_MISMATCH");
   });
 
@@ -295,7 +336,7 @@ describe("CONTROL bootstrap capable execution handoff", () => {
     fs.symlinkSync(target, redirected, "junction");
     const escapedState = path.join(redirected, "c2c-repair-control-state");
     const identities = { ...approvedIdentities, controlStateDir: escapedState };
-    expect(validateControlBootstrapIsolation({ ...input, controlStateDir: escapedState }, identities))
+    expect(validateControlBootstrapIsolation({ ...input, controlStateDir: escapedState }, identities, input.targetProfile))
       .toBe("CONTROL_IDENTITY_MISMATCH");
   });
 
@@ -303,10 +344,13 @@ describe("CONTROL bootstrap capable execution handoff", () => {
     const { input, root, approvedIdentities } = fixture();
     const changed = {
       ...input,
-      targetWorkspaceRoot: path.join(root, "substitute-target"),
-      targetStateDir: path.join(root, "substitute-target-state"),
+      targetProfile: {
+        ...input.targetProfile,
+        targetWorkspaceRoot: path.join(root, "substitute-target"),
+        targetStateDir: path.join(root, "substitute-target-state"),
+      },
     };
-    const deps = adapter(changed, { approvedIdentities });
+    const deps = adapter(changed, { approvedIdentities, approvedTargetProfile: input.targetProfile });
     const result = await runControlBootstrap(changed, deps);
     expect(result).toMatchObject({ state: "CONTROL_BOOTSTRAP_BLOCKED", reason: "CONTROL_IDENTITY_MISMATCH" });
     expect(deps.stateDirectoryWriteProbe).not.toHaveBeenCalled();
@@ -322,8 +366,8 @@ describe("CONTROL bootstrap capable execution handoff", () => {
 
   it("rejects TARGET-overlapping paths before probing or starting any Bridge", async () => {
     const { input, approvedIdentities } = fixture();
-    input.controlStateDir = input.targetStateDir;
-    const deps = adapter(input, { approvedIdentities });
+    input.controlStateDir = input.targetProfile.targetStateDir;
+    const deps = adapter(input, { approvedIdentities, approvedTargetProfile: input.targetProfile });
     const result = await runControlBootstrap(input, deps);
     expect(result).toMatchObject({ state: "CONTROL_BOOTSTRAP_BLOCKED", reason: "CONTROL_IDENTITY_MISMATCH" });
     expect(deps.stateDirectoryWriteProbe).not.toHaveBeenCalled();
@@ -965,7 +1009,7 @@ describe("CONTROL start and doctor cloudflared prechecks", () => {
     const { input } = fixture();
     const genericDiscovery = vi.fn(() => "C:\\tools\\cloudflared.exe");
     expect(resolveTunnelPrecheckCloudflared({
-      workspaceRoot: input.targetWorkspaceRoot,
+      workspaceRoot: input.targetProfile.targetWorkspaceRoot,
       profileCandidate: undefined,
       discoverGeneric: genericDiscovery,
     })).toBe("C:\\tools\\cloudflared.exe");

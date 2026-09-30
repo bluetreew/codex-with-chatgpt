@@ -4,6 +4,7 @@ import path from "node:path";
 import { getStateDir, writeSecureJson } from "../config/paths.js";
 import type { RecoveryState } from "./harness.js";
 import type { RecoverySessionSnapshot } from "./harness.js";
+import type { RecoveryTargetBinding } from "./target-binding.js";
 
 const knownStates: readonly RecoveryState[] = [
   "LOCAL_DIAGNOSIS", "LOCAL_RECOVERY", "LEGACY_BRIDGE_PROBE_UNSUPPORTED", "LOCAL_HEALTH_PASS", "ENDPOINT_COMPARE",
@@ -24,6 +25,7 @@ export interface RecoveryProgress {
   legacyMigrationEvidence?: { adminInfoStatus: 200; recoveryProbeStatus: 404; tunnelHealth: "UNHEALTHY" };
   sessionSnapshot?: RecoverySessionSnapshot | null;
   pairedConnectorName?: string;
+  targetBinding?: RecoveryTargetBinding;
 }
 
 export type LegacyBridgeReplacementMarkerResult = "CONSUMED" | "ALREADY_CONSUMED" | "FAILED";
@@ -51,6 +53,23 @@ export function readRecoveryProgress(workspaceId: string): RecoveryProgress | nu
   }
   if (!value || !knownStates.includes(value.state as RecoveryState) || typeof value.capableContextAttempted !== "boolean") return null;
   if (value.runId !== undefined && (typeof value.runId !== "string" || !safeRunId.test(value.runId))) return null;
+  let targetBinding: RecoveryTargetBinding | undefined;
+  if (value.targetBinding !== undefined) {
+    const binding = value.targetBinding as Partial<RecoveryTargetBinding> | null;
+    if (!binding || typeof binding !== "object" ||
+        typeof binding.profileId !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(binding.profileId) ||
+        typeof binding.workspaceId !== "string" || !/^[a-f0-9]{12}$/.test(binding.workspaceId) ||
+        typeof binding.workspaceRoot !== "string" || !path.isAbsolute(binding.workspaceRoot) ||
+        typeof binding.stateDir !== "string" || !path.isAbsolute(binding.stateDir)) {
+      throw new Error("RECOVERY_TARGET_BINDING_INVALID");
+    }
+    targetBinding = {
+      profileId: binding.profileId,
+      workspaceId: binding.workspaceId,
+      workspaceRoot: binding.workspaceRoot,
+      stateDir: binding.stateDir,
+    };
+  }
   const runId = value.runId ?? `legacy-${crypto.createHash("sha256").update(`${workspaceId}\0${raw}`).digest("hex")}`;
   return {
     runId,
@@ -65,6 +84,7 @@ export function readRecoveryProgress(workspaceId: string): RecoveryProgress | nu
       : {}),
     ...(value.sessionSnapshot && typeof value.sessionSnapshot === "object" ? { sessionSnapshot: value.sessionSnapshot as RecoverySessionSnapshot } : {}),
     ...(typeof value.pairedConnectorName === "string" ? { pairedConnectorName: value.pairedConnectorName } : {}),
+    ...(targetBinding ? { targetBinding } : {}),
   };
 }
 

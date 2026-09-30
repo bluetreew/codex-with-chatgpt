@@ -27,7 +27,10 @@ import {
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
-import { getStateDir, managedCloudflaredDirectory, readJsonIfExists } from "../config/paths.js";
+import { controlTargetRegistryFile, getStateDir, managedCloudflaredDirectory, readJsonIfExists } from "../config/paths.js";
+import { ControlTargetRegistryError, listControlTargetProfiles, registerControlTargetProfile, resolveControlTargetProfile } from "../config/control-target-registry.js";
+import { ControlTargetSelectionError, selectControlTargetProfile } from "../control-target-selection.js";
+import { recoveryTargetBindingFromProfile, matchRecoveryTargetBinding } from "../recovery/target-binding.js";
 import { networkProfileFile, readNetworkProfile, writeNetworkProfile } from "../config/network-profile.js";
 import { ProxyAgent, fetch as proxyFetch } from "undici";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
@@ -78,6 +81,7 @@ import {
   probeControlStateDirectoryWrite,
   runControlBootstrap,
   isApprovedControlWorkspaceRoot,
+  validateControlBootstrapControlIdentity,
   resolveTunnelPrecheckCloudflared,
   validateControlBootstrapIsolation,
 } from "../control-bootstrap.js";
@@ -92,6 +96,29 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+function resolveRecoveryTarget(profileId: string, workspaceArgument?: string) {
+  const profile = resolveControlTargetProfile(profileId, {
+    registryFile: controlTargetRegistryFile(),
+    controlWorkspaceRoot: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot,
+    controlStateDir: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir,
+  });
+  const workspace = new Workspace(profile.targetWorkspaceRoot);
+  if (workspace.id !== profile.workspaceId ||
+      (workspaceArgument !== undefined && !sameCanonicalPath(resolveWorkspace(workspaceArgument), profile.targetWorkspaceRoot))) {
+    throw new Error("RECOVERY_TARGET_BINDING_MISMATCH");
+  }
+  process.env.C2C_STATE_DIR = profile.targetStateDir;
+  return { profile, binding: recoveryTargetBindingFromProfile(profile), workspace };
+}
+
+function sameCanonicalPath(left: string, right: string): boolean {
+  const resolvedLeft = path.resolve(left);
+  const resolvedRight = path.resolve(right);
+  return process.platform === "win32" || process.platform === "darwin"
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    : resolvedLeft === resolvedRight;
 }
 
 function cloudflaredAccountForWorkspace(workspaceRoot: string): ProcessCloudflaredAccount {
@@ -280,6 +307,82 @@ program
   .description(`${PRODUCT_NAME} — ChatGPT thinks. Codex works.`)
   .version(VERSION, "-v, --version")
   .configureHelp({ sortSubcommands: true });
+
+const controlTargetCmd = program.command("control-target").description("Manage CONTROL recovery target profiles");
+
+controlTargetCmd
+  .command("list")
+  .description("List the built-in and registered target profiles without changing state")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    try {
+      const registryFile = controlTargetRegistryFile();
+      const profiles = listControlTargetProfiles({ registryFile });
+      const payload = { ok: true, registryFile, profiles };
+      if (opts.json) say(JSON.stringify(payload));
+      else {
+        for (const profile of profiles) say(`${profile.profileId} — ${profile.targetWorkspaceRoot}`);
+      }
+    } catch (error) {
+      const code = error instanceof ControlTargetRegistryError ? error.code : "CONTROL_TARGET_REGISTRY_INVALID";
+      const message = error instanceof Error ? error.message : String(error);
+      if (opts.json) say(JSON.stringify({ ok: false, code, error: message }));
+      else cross(message);
+      process.exitCode = 1;
+    }
+  });
+
+controlTargetCmd
+  .command("resolve")
+  .description("Resolve and validate one registered target profile without starting services")
+  .requiredOption("--profile <id>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { profile: string; json: boolean }) => {
+    try {
+      const registryFile = controlTargetRegistryFile();
+      const profile = resolveControlTargetProfile(opts.profile, {
+        registryFile,
+        controlWorkspaceRoot: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot,
+        controlStateDir: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir,
+      });
+      const payload = { ok: true, registryFile, profile };
+      if (opts.json) say(JSON.stringify(payload));
+      else check(`Resolved ${profile.profileId} (${profile.workspaceId})`);
+    } catch (error) {
+      const code = error instanceof ControlTargetRegistryError ? error.code : "CONTROL_TARGET_REGISTRY_INVALID";
+      const message = error instanceof Error ? error.message : String(error);
+      if (opts.json) say(JSON.stringify({ ok: false, code, error: message }));
+      else cross(message);
+      process.exitCode = 1;
+    }
+  });
+
+controlTargetCmd
+  .command("register")
+  .description("Register a target workspace without creating its state directory or starting services")
+  .requiredOption("--profile <id>")
+  .requiredOption("--workspace <path>")
+  .requiredOption("--state-dir <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { profile: string; workspace: string; stateDir: string; json: boolean }) => {
+    try {
+      const registryFile = controlTargetRegistryFile();
+      const profile = registerControlTargetProfile(opts.profile, opts.workspace, opts.stateDir, {
+        registryFile,
+        controlWorkspaceRoot: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot,
+        controlStateDir: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir,
+      });
+      const payload = { ok: true, registryFile, profile };
+      if (opts.json) say(JSON.stringify(payload));
+      else check(`Registered ${profile.profileId} (${profile.workspaceId})`);
+    } catch (error) {
+      const code = error instanceof ControlTargetRegistryError ? error.code : "CONTROL_TARGET_REGISTRY_INVALID";
+      const message = error instanceof Error ? error.message : String(error);
+      if (opts.json) say(JSON.stringify({ ok: false, code, error: message }));
+      else cross(message);
+      process.exitCode = 1;
+    }
+  });
 
 program.command("network")
   .description("Manage a workspace-local C2C network profile")
@@ -845,15 +948,17 @@ program
   .description("Probe and prepare the isolated CONTROL Bridge without starting a Tunnel")
   .requiredOption("--workspace <path>")
   .requiredOption("--control-state-dir <path>")
-  .requiredOption("--target-workspace <path>")
-  .requiredOption("--target-state-dir <path>")
+  .option("--target-profile <id>")
+  .option("--target-workspace <path>", "legacy; accepted only when exactly matching the built-in MOZI profile")
+  .option("--target-state-dir <path>", "legacy; accepted only when exactly matching the built-in MOZI profile")
   .option("--capable-context-retry", "consume the single Codex-orchestrated capable-context handoff", false)
   .option("--json", "machine-readable output", false)
   .action(async (opts: {
     workspace: string;
     controlStateDir: string;
-    targetWorkspace: string;
-    targetStateDir: string;
+    targetProfile?: string;
+    targetWorkspace?: string;
+    targetStateDir?: string;
     capableContextRetry: boolean;
     json: boolean;
   }) => {
@@ -871,12 +976,41 @@ program
       else say(JSON.stringify(value, null, 2));
     };
     try {
+      const controlIdentityError = validateControlBootstrapControlIdentity({
+        controlWorkspaceRoot: opts.workspace,
+        controlStateDir: opts.controlStateDir,
+      });
+      if (controlIdentityError) {
+        emit(blocked(controlIdentityError));
+        return;
+      }
+      const hasLegacyWorkspace = opts.targetWorkspace !== undefined;
+      const hasLegacyStateDir = opts.targetStateDir !== undefined;
+      if (hasLegacyWorkspace !== hasLegacyStateDir || (opts.targetProfile && (hasLegacyWorkspace || hasLegacyStateDir))) {
+        emit(blocked("CONTROL_TARGET_PROFILE_REQUIRED"));
+        return;
+      }
+
+      let targetProfile;
+      try {
+        const profileId = selectControlTargetProfile(opts);
+        targetProfile = resolveControlTargetProfile(profileId, {
+          registryFile: controlTargetRegistryFile(),
+          controlWorkspaceRoot: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot,
+          controlStateDir: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir,
+        });
+      } catch (error) {
+        const code = error instanceof ControlTargetRegistryError || error instanceof ControlTargetSelectionError
+          ? error.code
+          : "CONTROL_TARGET_REGISTRY_INVALID";
+        emit(blocked(code));
+        return;
+      }
       const isolationError = validateControlBootstrapIsolation({
         controlWorkspaceRoot: opts.workspace,
         controlStateDir: opts.controlStateDir,
-        targetWorkspaceRoot: opts.targetWorkspace,
-        targetStateDir: opts.targetStateDir,
-      }, APPROVED_CONTROL_BOOTSTRAP_IDENTITIES);
+        targetProfile,
+      }, APPROVED_CONTROL_BOOTSTRAP_IDENTITIES, targetProfile);
       if (isolationError) {
         emit(blocked(isolationError));
         return;
@@ -897,11 +1031,11 @@ program
         workspaceId: workspace.id,
         controlWorkspaceRoot: workspace.root,
         controlStateDir: expectedStateDir,
-        targetWorkspaceRoot: opts.targetWorkspace,
-        targetStateDir: opts.targetStateDir,
+        targetProfile,
         capableContextRetry: opts.capableContextRetry,
       }, createControlBootstrapCliAdapter(workspace.id, {
         approvedIdentities: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
+        approvedTargetProfile: targetProfile,
         stateDirectoryWriteProbe: probeControlStateDirectoryWrite,
         findBridge: (workspaceId) => findBridgeObservation(workspaceId),
         startBridge: (workspaceRoot) => ensureBridge(workspaceRoot),
@@ -924,11 +1058,12 @@ program
 program
   .command("recovery-probe", { hidden: true })
   .description("Probe child-process capability locally and inside an existing Bridge")
-  .option("-w, --workspace <path>")
+  .requiredOption("--target-profile <id>")
+  .option("--workspace <path>", "optional workspace identity assertion")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; json: boolean }) => {
+  .action(async (opts: { targetProfile: string; workspace?: string; json: boolean }) => {
     try {
-      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const { workspace } = resolveRecoveryTarget(opts.targetProfile, opts.workspace);
       const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspace.id));
       const cloudflaredPath = profile?.cloudflaredPath;
       const localProbe = await probeExecutionContext({ context: "local", cloudflaredPath });
@@ -984,21 +1119,48 @@ program
   .command("recovery-plan", { hidden: true })
   .description("Return the next deterministic emergency-recovery state/action")
   .requiredOption("--facts-base64 <value>")
-  .requiredOption("--workspace <path>")
-  .option("--new-run", "reset the workspace-local recovery run state", false)
+  .requiredOption("--target-profile <id>")
+  .option("--workspace <path>", "optional workspace identity assertion")
+  .option("--new-run", "start a new profile-bound recovery run", false)
   .option("--authorize-restart", "consume the single restricted-Bridge restart attempt", false)
   .option("--json", "machine-readable output", false)
-  .action((opts: { factsBase64: string; workspace: string; newRun: boolean; authorizeRestart: boolean; json: boolean }) => {
+  .action((opts: { factsBase64: string; targetProfile: string; workspace?: string; newRun: boolean; authorizeRestart: boolean; json: boolean }) => {
     try {
-      if (!opts.workspace.trim()) throw new Error("--workspace must be a non-empty path");
       const facts = JSON.parse(Buffer.from(opts.factsBase64, "base64").toString("utf8")) as RecoveryFacts;
       if (opts.newRun && facts.transitionEvent) throw new Error("--new-run cannot be combined with a recovery transition event");
-      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      let target: ReturnType<typeof resolveRecoveryTarget>;
+      try {
+        target = resolveRecoveryTarget(opts.targetProfile, opts.workspace);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "RECOVERY_TARGET_PROFILE_INVALID";
+        const blocked = { ok: false, state: "BLOCKED_STATE_INCONSISTENT", nextAction: "BLOCKED_STATE_INCONSISTENT", humanActionRequired: false, facts: { reason } };
+        if (opts.json) say(JSON.stringify(blocked)); else say(JSON.stringify(blocked, null, 2));
+        return;
+      }
+      const { workspace, binding } = target;
+      if (facts.workspace && facts.workspace.workspaceId !== binding.workspaceId) {
+        const blocked = { ok: false, state: "BLOCKED_STATE_INCONSISTENT", nextAction: "BLOCKED_STATE_INCONSISTENT", humanActionRequired: false, facts: { reason: "RECOVERY_TARGET_BINDING_MISMATCH" } };
+        if (opts.json) say(JSON.stringify(blocked)); else say(JSON.stringify(blocked, null, 2));
+        return;
+      }
       const workspaceId = workspace.id;
-      let progress = readRecoveryProgress(workspaceId);
+      let progress;
+      try {
+        progress = readRecoveryProgress(workspaceId);
+      } catch (error) {
+        const blocked = { ok: false, state: "BLOCKED_STATE_INCONSISTENT", nextAction: "BLOCKED_STATE_INCONSISTENT", humanActionRequired: false, facts: { reason: error instanceof Error ? error.message : "RECOVERY_TARGET_BINDING_INVALID" } };
+        if (opts.json) say(JSON.stringify(blocked)); else say(JSON.stringify(blocked, null, 2));
+        return;
+      }
+      if (progress && matchRecoveryTargetBinding(progress.targetBinding, binding) === "MISMATCH") {
+        const blocked = { ok: false, state: "BLOCKED_STATE_INCONSISTENT", nextAction: "BLOCKED_STATE_INCONSISTENT", humanActionRequired: false, facts: { reason: "RECOVERY_TARGET_BINDING_MISMATCH" } };
+        if (opts.json) say(JSON.stringify(blocked)); else say(JSON.stringify(blocked, null, 2));
+        return;
+      }
+      if (progress && !progress.targetBinding) progress = { ...progress, targetBinding: binding };
       const refuseNewRun = opts.newRun && progress?.state === "BLOCKED_BRIDGE_UNKNOWN";
       if (opts.newRun && !refuseNewRun) {
-        progress = { runId: createRecoveryRunId(), state: "LOCAL_DIAGNOSIS" as const, capableContextAttempted: false, bridgeRestartAttempted: false, legacyMigrationAuthorized: false, legacyMigrationAttempted: false, sessionSnapshot: facts.session ?? null };
+        progress = { runId: createRecoveryRunId(), state: "LOCAL_DIAGNOSIS" as const, capableContextAttempted: false, bridgeRestartAttempted: false, legacyMigrationAuthorized: false, legacyMigrationAttempted: false, sessionSnapshot: facts.session ?? null, targetBinding: binding };
         writeRecoveryProgress(workspaceId, progress);
       }
       if (progress) {
@@ -1121,11 +1283,17 @@ program
           legacyMigrationEvidence: progress?.legacyMigrationEvidence,
           sessionSnapshot: progress?.sessionSnapshot ?? facts.session ?? null,
           pairedConnectorName: progress?.pairedConnectorName ?? (facts.transitionEvent === "PAIRING_COMPLETED" && result.state === "AI_CONFIRM_CONNECTOR" ? facts.actualConnectorName : undefined),
+          targetBinding: binding,
         });
       }
-      if (opts.json) say(JSON.stringify(result));
-      else say(JSON.stringify(result, null, 2));
+      const reportedResult = { ...result, facts: { ...result.facts, targetBinding: binding } };
+      if (opts.json) say(JSON.stringify(reportedResult));
+      else say(JSON.stringify(reportedResult, null, 2));
     } catch (error) {
+      if (error instanceof Error && error.message === "RECOVERY_TARGET_BINDING_INVALID") {
+        say(JSON.stringify({ ok: false, state: "BLOCKED_STATE_INCONSISTENT", reason: error.message }));
+        return;
+      }
       handleCliError(error, opts.json);
     }
   });
@@ -1133,14 +1301,24 @@ program
 program
   .command("recovery-replace-legacy-bridge", { hidden: true })
   .description("Replace one explicitly authorized legacy Bridge without starting its Tunnel")
-  .requiredOption("--workspace <path>")
+  .requiredOption("--target-profile <id>")
+  .option("--workspace <path>", "optional workspace identity assertion")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace: string; json: boolean }) => {
+  .action(async (opts: { targetProfile: string; workspace?: string; json: boolean }) => {
     let workspace: Workspace | null = null;
     let progress = null as ReturnType<typeof readRecoveryProgress>;
     try {
-      workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const target = resolveRecoveryTarget(opts.targetProfile, opts.workspace);
+      workspace = target.workspace;
       progress = readRecoveryProgress(workspace.id);
+      if (progress && matchRecoveryTargetBinding(progress.targetBinding, target.binding) === "MISMATCH") {
+        say(JSON.stringify({ ok: false, state: "BLOCKED_STATE_INCONSISTENT", reason: "RECOVERY_TARGET_BINDING_MISMATCH" }));
+        return;
+      }
+      if (progress && !progress.targetBinding) {
+        progress = { ...progress, targetBinding: target.binding };
+        writeRecoveryProgress(workspace.id, progress);
+      }
       if (!progress || progress.state !== "LEGACY_BRIDGE_PROBE_UNSUPPORTED" ||
           !progress.bridgeRestartAttempted || progress.legacyMigrationAuthorized !== true || progress.legacyMigrationAttempted === true) {
         say(JSON.stringify({ ok: false, state: "INVALID_RECOVERY_TRANSITION", reason: "legacy replacement was not selected and authorized exactly once by the recovery planner" }));
@@ -1255,6 +1433,10 @@ program
       writeRecoveryProgress(workspace.id, progress);
       say(JSON.stringify({ ...migration, bridgeRestartAttempted: true, legacyMigrationAttempted: true }));
     } catch (error) {
+      if (error instanceof Error && error.message === "RECOVERY_TARGET_BINDING_INVALID") {
+        say(JSON.stringify({ ok: false, state: "BLOCKED_STATE_INCONSISTENT", reason: error.message }));
+        return;
+      }
       if (workspace && progress?.legacyMigrationAttempted === true) {
         progress.state = "BLOCKED_LOCAL_EXECUTION";
         progress.legacyMigrationAuthorized = false;

@@ -18,6 +18,11 @@ export function canonicalControlStateDirectory(homeDirectory = os.homedir()): st
   return path.join(canonicalCodexDirectory(homeDirectory), "c2c-repair-control-state");
 }
 
+/** Read-only target registry for CONTROL recovery profiles. */
+export function controlTargetRegistryFile(homeDirectory = os.homedir()): string {
+  return path.join(canonicalCodexDirectory(homeDirectory), "c2c-repair-control", "targets.json");
+}
+
 /**
  * State directory resolution, following OS conventions.
  * Override with C2C_STATE_DIR (used heavily by tests).

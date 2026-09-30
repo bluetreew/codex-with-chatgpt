@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { findBridgeObservation, findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { findBridgeObservation, findLiveBridge, normalizeProcessCreatedAt, probeBridge, queryProcessCreatedAt, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
 import { networkProcessEnv, readNetworkProfile } from "../config/network-profile.js";
 
@@ -104,6 +104,16 @@ export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
   const runtime = readRuntimeState(workspace.id);
   if (!runtime) return false;
+  if (runtime.workspaceId !== workspace.id) return false;
+  try {
+    const recordedRoot = fs.realpathSync.native(runtime.workspaceRoot);
+    const rootsMatch = process.platform === "win32" || process.platform === "darwin"
+      ? recordedRoot.toLowerCase() === workspace.root.toLowerCase()
+      : recordedRoot === workspace.root;
+    if (!rootsMatch) return false;
+  } catch {
+    return false;
+  }
   const healthy = await probeBridge(runtime.port);
   if (healthy && healthy.workspaceId === workspace.id) {
     try {
@@ -113,6 +123,10 @@ export async function stopBridge(workspaceRoot: string): Promise<boolean> {
       // fall through to kill
     }
   }
+  if (healthy && healthy.workspaceId !== workspace.id) return false;
+  const recordedCreation = normalizeProcessCreatedAt(runtime.processCreatedAt);
+  const currentCreation = normalizeProcessCreatedAt(queryProcessCreatedAt(runtime.pid));
+  if (!recordedCreation || !currentCreation || recordedCreation !== currentCreation) return false;
   try {
     process.kill(runtime.pid, "SIGTERM");
     return true;

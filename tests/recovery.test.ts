@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -26,20 +27,100 @@ import {
 import { replaceLegacyBridgeOnce, type LegacyBridgeMigrationAdapter } from "../src/recovery/legacy-migration.js";
 import type { TunnelProvider } from "../src/tunnel/provider.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
+import { cleanup, write } from "./helpers.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(repoRoot, "src", "cli", "index.ts");
 const skillRoot = path.join(repoRoot, "skill", "c2c-emergency-recovery");
 const tempDirs: string[] = [];
 
+function makeTmpDir(name: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), `c2c-${name}-`));
+}
+
+function isolateStateDir(): string {
+  const dir = makeTmpDir("state");
+  process.env.C2C_STATE_DIR = dir;
+  return dir;
+}
+
 function runCli(args: string[], env: NodeJS.ProcessEnv = process.env) {
+  const actualArgs = [...args];
+  const command = actualArgs[0];
+  let childEnv = { ...env };
+  if (["recovery-plan", "recovery-probe", "recovery-replace-legacy-bridge"].includes(command)) {
+    const workspaceIndex = actualArgs.indexOf("--workspace");
+    const workspaceArgument = workspaceIndex >= 0 ? actualArgs[workspaceIndex + 1] : undefined;
+    if (workspaceArgument && workspaceArgument.trim()) {
+      const workspaceRoot = fs.realpathSync.native(path.resolve(workspaceArgument));
+      const workspace = new Workspace(workspaceRoot);
+      const stateDir = childEnv.C2C_STATE_DIR ?? makeTmpDir("recovery-profile-state");
+      if (!childEnv.C2C_STATE_DIR) tempDirs.push(stateDir);
+      const profileIdIndex = actualArgs.indexOf("--target-profile");
+      const profileId = profileIdIndex >= 0 ? actualArgs[profileIdIndex + 1] : "test-target";
+      if (profileIdIndex < 0) actualArgs.splice(1, 0, "--target-profile", profileId);
+      const home = makeTmpDir("recovery-profile-home");
+      tempDirs.push(home);
+      const registryFile = path.join(home, ".codex", "c2c-repair-control", "targets.json");
+      fs.mkdirSync(path.dirname(registryFile), { recursive: true });
+      fs.writeFileSync(registryFile, JSON.stringify({
+        schemaVersion: 1,
+        profiles: [{
+          schemaVersion: 1,
+          profileId,
+          targetWorkspaceRoot: workspaceRoot,
+          targetStateDir: stateDir,
+          expectedWorkspaceId: workspace.id,
+        }],
+      }));
+      const progressPath = path.join(stateDir, "recovery-progress", `${encodeURIComponent(workspace.id).replaceAll("%", "_")}.json`);
+      if (fs.existsSync(progressPath)) {
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8"));
+        if (!progress.targetBinding) {
+          progress.targetBinding = { profileId, workspaceId: workspace.id, workspaceRoot, stateDir: path.resolve(stateDir) };
+          fs.writeFileSync(progressPath, JSON.stringify(progress));
+        }
+      }
+      childEnv = { ...childEnv, USERPROFILE: home, HOME: home, C2C_STATE_DIR: stateDir };
+      const factsIndex = actualArgs.indexOf("--facts-base64");
+      if (factsIndex >= 0) {
+        const input = JSON.parse(Buffer.from(actualArgs[factsIndex + 1], "base64").toString("utf8")) as any;
+        const oldWorkspaceId = input.workspace?.workspaceId;
+        if (input.workspace) input.workspace.workspaceId = workspace.id;
+        if (input.workspaceInfo?.workspaceId === oldWorkspaceId) input.workspaceInfo.workspaceId = workspace.id;
+        if (input.checkRoundTrip?.workspaceId === oldWorkspaceId) input.checkRoundTrip.workspaceId = workspace.id;
+        actualArgs[factsIndex + 1] = Buffer.from(JSON.stringify(input), "utf8").toString("base64");
+      }
+    }
+  }
+  return spawnSync(process.execPath, ["--import", "tsx", cliEntry, ...actualArgs], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    windowsHide: true,
+    env: childEnv,
+  });
+}
+
+function runCliUnprepared(args: string[], env: NodeJS.ProcessEnv) {
   return spawnSync(process.execPath, ["--import", "tsx", cliEntry, ...args], {
     cwd: repoRoot,
     encoding: "utf8",
     windowsHide: true,
     env,
   });
+}
+
+function makeRecoveryProfileHome(workspaceRoot: string, stateDir: string, profileId = "test-target"): string {
+  const home = makeTmpDir("recovery-profile-home");
+  tempDirs.push(home);
+  const root = fs.realpathSync.native(workspaceRoot);
+  const workspace = new Workspace(root);
+  const registryFile = path.join(home, ".codex", "c2c-repair-control", "targets.json");
+  fs.mkdirSync(path.dirname(registryFile), { recursive: true });
+  fs.writeFileSync(registryFile, JSON.stringify({ schemaVersion: 1, profiles: [{
+    schemaVersion: 1, profileId, targetWorkspaceRoot: root, targetStateDir: path.resolve(stateDir), expectedWorkspaceId: workspace.id,
+  }] }));
+  return home;
 }
 
 afterEach(() => {
@@ -127,15 +208,20 @@ describe("recovery helper argument forwarding", () => {
       ...overrides,
     }));
     if (persistPlanner) {
-      writeRecoveryProgress(new Workspace(workspace).id, { state: "LOCAL_RECOVERY", capableContextAttempted: false, bridgeRestartAttempted: false });
+      const workspaceId = new Workspace(workspace).id;
+      writeRecoveryProgress(workspaceId, {
+        state: "LOCAL_RECOVERY", capableContextAttempted: false, bridgeRestartAttempted: false,
+        targetBinding: { profileId: "test-target", workspaceId, workspaceRoot: fs.realpathSync.native(workspace), stateDir: path.resolve(stateDir) },
+      });
     }
+    const profileHome = makeRecoveryProfileHome(workspace, stateDir);
     const script = path.join(skillRoot, "scripts", "c2c-start-tunnel.ps1");
     const fakeCli = path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs");
     const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
-      "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli, "-Action", "restart"], {
+      "-TargetProfile", "test-target", "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli, "-Action", "restart"], {
       encoding: "utf8",
       windowsHide: true,
-      env: { ...process.env, C2C_TEST_RECOVERY_FIXTURE: fixtureFile },
+      env: { ...process.env, USERPROFILE: profileHome, HOME: profileHome, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixtureFile },
     });
     return { result, state: JSON.parse(fs.readFileSync(fixtureFile, "utf8")) as Record<string, any> };
   }
@@ -187,6 +273,7 @@ describe("recovery helper argument forwarding", () => {
     const fixtureFile = path.join(root, "scenario.json");
     const workspaceId = new Workspace(workspace).id;
     const progressPath = recoveryProgressFile(workspaceId);
+    const profileHome = makeRecoveryProfileHome(workspace, stateDir);
     fs.writeFileSync(fixtureFile, JSON.stringify({
       calls: [], useRealPlanner: true, session: sessionFixture, workspacePath: workspace,
       probe: legacyProbe, probeAfterMigration: currentProbe,
@@ -206,13 +293,14 @@ describe("recovery helper argument forwarding", () => {
       legacyMigrationAttempted: false,
       sessionSnapshot: sessionFixture,
       pairedConnectorName: sessionFixture.connectorName,
+      targetBinding: { profileId: "test-target", workspaceId, workspaceRoot: fs.realpathSync.native(workspace), stateDir: path.resolve(stateDir) },
     });
     const script = path.join(skillRoot, "scripts", "c2c-start-tunnel.ps1");
     const fakeCli = path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs");
     const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
-      "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli, "-Action", "migrate-legacy"], {
+      "-TargetProfile", "test-target", "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli, "-Action", "migrate-legacy"], {
       encoding: "utf8", windowsHide: true,
-      env: { ...process.env, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixtureFile },
+      env: { ...process.env, USERPROFILE: profileHome, HOME: profileHome, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixtureFile },
     });
     return { result, state: JSON.parse(fs.readFileSync(fixtureFile, "utf8")) as Record<string, any>, workspace, workspaceId };
   }
@@ -329,7 +417,7 @@ describe("recovery helper argument forwarding", () => {
     const script = path.join(skillRoot, "scripts", scriptName);
     const fakeCli = path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs");
     const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
-      ...cliArgs, "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
+      ...cliArgs, "-TargetProfile", "test-target", "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
       encoding: "utf8", windowsHide: true,
       env: { ...process.env, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
     });
@@ -355,6 +443,7 @@ describe("recovery helper argument forwarding", () => {
       doctor,
     }));
     const plannerEnv = { ...process.env, C2C_STATE_DIR: stateDir };
+    const profileHome = makeRecoveryProfileHome(workspace, stateDir);
     const plannerFacts = facts({
       doctor,
       session: {
@@ -382,9 +471,9 @@ describe("recovery helper argument forwarding", () => {
     const fakeCli = path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs");
     const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(skillRoot, "scripts", "c2c-confirm.ps1"),
       "-RecoveryState", "AI_CONFIRM_CONNECTOR", "-ConnectorName", "MOZI v4", "-McpUrl", "https://wrong.invalid/mcp",
-      "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
+      "-TargetProfile", "test-target", "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
       encoding: "utf8", windowsHide: true,
-      env: { ...process.env, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
+      env: { ...process.env, USERPROFILE: profileHome, HOME: profileHome, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
     });
     const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
     expect(JSON.parse(result.stdout.trim()).state).toBe("INVALID_RECOVERY_TRANSITION");
@@ -395,9 +484,9 @@ describe("recovery helper argument forwarding", () => {
 
     const wrongIdentity = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(skillRoot, "scripts", "c2c-confirm.ps1"),
       "-RecoveryState", "AI_CONFIRM_CONNECTOR", "-ConnectorName", "MOZI v5", "-McpUrl", "https://fixture.invalid/mcp",
-      "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
+      "-TargetProfile", "test-target", "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
       encoding: "utf8", windowsHide: true,
-      env: { ...process.env, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
+      env: { ...process.env, USERPROFILE: profileHome, HOME: profileHome, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
     });
     const callsAfterWrongIdentity = JSON.parse(fs.readFileSync(fixturePath, "utf8")).calls as string[][];
     expect(JSON.parse(wrongIdentity.stdout.trim()).state).toBe("INVALID_RECOVERY_TRANSITION");
@@ -425,12 +514,17 @@ describe("recovery helper argument forwarding", () => {
         doctor: { report: Object.fromEntries(["node", "sandbox", "workspace", "bridge", "mcp", "oauth", "tunnel"].map((key) => [key, { ok: true }])), chatgptRepair: { needed: true, connectorName: "MOZI v3", mcpUrl: "https://fixture.invalid/mcp", previousMcpUrl: "https://old.invalid/mcp" }, namedRepair: { needed: false } },
       }));
       const workspaceId = new Workspace(workspace).id;
-      writeRecoveryProgress(workspaceId, { state: "AI_CONFIRM_CONNECTOR", capableContextAttempted: false, bridgeRestartAttempted: false, sessionSnapshot: sessionFixture, pairedConnectorName: "MOZI v4" });
+      writeRecoveryProgress(workspaceId, {
+        state: "AI_CONFIRM_CONNECTOR", capableContextAttempted: false, bridgeRestartAttempted: false,
+        sessionSnapshot: sessionFixture, pairedConnectorName: "MOZI v4",
+        targetBinding: { profileId: "test-target", workspaceId, workspaceRoot: fs.realpathSync.native(workspace), stateDir: path.resolve(stateDir) },
+      });
+      const profileHome = makeRecoveryProfileHome(workspace, stateDir);
       const result = spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(skillRoot, "scripts", "c2c-confirm.ps1"),
         "-RecoveryState", "AI_CONFIRM_CONNECTOR", "-ConnectorName", "MOZI v4", "-McpUrl", "https://fixture.invalid/mcp",
-        "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs")], {
+        "-TargetProfile", "test-target", "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs")], {
         encoding: "utf8", windowsHide: true,
-        env: { ...process.env, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
+        env: { ...process.env, USERPROFILE: profileHome, HOME: profileHome, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
       });
       expect(JSON.parse(result.stdout.trim()).state, result.stdout + result.stderr).toBe("BLOCKED_STATE_INCONSISTENT");
       expect(readRecoveryProgress(workspaceId)?.state).toBe("BLOCKED_STATE_INCONSISTENT");
@@ -454,11 +548,12 @@ describe("recovery helper argument forwarding", () => {
       probe: { bridgeStatus: "healthy", localProbe, bridgeProbe: localProbe, bridgeProbeError: false },
       doctor: { report: Object.fromEntries(["node", "sandbox", "workspace", "bridge", "mcp", "oauth", "tunnel"].map((key) => [key, { ok: true }])), chatgptRepair: { needed: true, connectorName: "MOZI v3", mcpUrl: "https://fixture.invalid/mcp", previousMcpUrl: "https://old.invalid/mcp" }, namedRepair: { needed: false } },
     }));
+    const profileHome = makeRecoveryProfileHome(workspace, stateDir);
     const fakeCli = path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs");
     const run = (scriptName: string, args: string[]) => spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(skillRoot, "scripts", scriptName), ...args,
-      "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
+      "-TargetProfile", "test-target", "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
       encoding: "utf8", windowsHide: true,
-      env: { ...process.env, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
+      env: { ...process.env, USERPROFILE: profileHome, HOME: profileHome, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
     });
     const status = (args: string[]) => JSON.parse(run("c2c-status.ps1", args).stdout.trim());
     expect(status(["-StartNewRecovery"]).state).toBe("HUMAN_MCP_APP_GATE");
@@ -477,6 +572,7 @@ describe("recovery helper argument forwarding", () => {
     tempDirs.push(root);
     const workspace = path.join(root, "MOZI workspace");
     fs.mkdirSync(workspace, { recursive: true });
+    const resolvedWorkspaceId = new Workspace(workspace).id;
     const stateDir = path.join(root, "state");
     fs.mkdirSync(stateDir, { recursive: true });
     const fixturePath = path.join(root, "scenario.json");
@@ -487,11 +583,12 @@ describe("recovery helper argument forwarding", () => {
       probe: { bridgeStatus: "healthy", localProbe, bridgeProbe: localProbe, bridgeProbeError: false },
       doctor: { report: Object.fromEntries(["node", "sandbox", "workspace", "bridge", "mcp", "oauth", "tunnel"].map((key) => [key, { ok: true }])), chatgptRepair: { needed: true, connectorName: "MOZI v3", mcpUrl: "https://fixture.invalid/mcp", previousMcpUrl: "https://old.invalid/mcp" }, namedRepair: { needed: false } },
     }));
+    const profileHome = makeRecoveryProfileHome(workspace, stateDir);
     const fakeCli = path.join(repoRoot, "tests", "fixtures", "fake-recovery-cli.mjs");
     const run = (scriptName: string, args: string[]) => spawnSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(skillRoot, "scripts", scriptName), ...args,
-      "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
+      "-TargetProfile", "test-target", "-WorkspacePath", workspace, "-StateDir", stateDir, "-C2cJs", fakeCli], {
       encoding: "utf8", windowsHide: true,
-      env: { ...process.env, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
+      env: { ...process.env, USERPROFILE: profileHome, HOME: profileHome, C2C_STATE_DIR: stateDir, C2C_TEST_RECOVERY_FIXTURE: fixturePath },
     });
     const status = (args: string[]) => JSON.parse(run("c2c-status.ps1", args).stdout.trim());
 
@@ -504,7 +601,7 @@ describe("recovery helper argument forwarding", () => {
     expect(confirmation.recoveryState).toBe("POST_RECOVERY_VERIFY");
     const complete = status([
       "-RecoveryState", "POST_RECOVERY_VERIFY", "-Phase", "POST_RECOVERY_VERIFY", "-ConnectorConfirmed",
-      "-WorkspaceInfoName", "Fixture Workspace", "-WorkspaceInfoId", "fixture-workspace", "-SavedChatUrlAfter", savedUrl,
+      "-WorkspaceInfoName", "Fixture Workspace", "-WorkspaceInfoId", resolvedWorkspaceId, "-SavedChatUrlAfter", savedUrl,
       "-CheckId", "check-1", "-ReplyCheckId", "check-1",
     ]);
     expect(complete.state, JSON.stringify(complete)).toBe("COMPLETE");
@@ -530,7 +627,7 @@ describe("recovery helper argument forwarding", () => {
     fs.mkdirSync(workspace, { recursive: true });
     const stateDir = path.join(root, "state dir");
     fs.mkdirSync(stateDir, { recursive: true });
-    const fakeCli = write(root, "fake c2c.js", "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
+    const fakeCli = write(root, "fake c2c.js", "const a=process.argv.slice(2);process.stdout.write(JSON.stringify(a[0]==='control-target'?{ok:true,profile:{profileId:a[a.indexOf('--profile')+1],targetWorkspaceRoot:process.env.C2C_PROFILE_RESOLVE_WORKSPACE,targetStateDir:process.env.C2C_PROFILE_RESOLVE_STATE,workspaceId:'smoke'}}:a));\n");
     const smokeScript = path.join(repoRoot, "tests", "fixtures", "recovery-wrapper-smoke.ps1");
     const common = path.join(skillRoot, "scripts", "_common.ps1");
     const result = spawnSync(
@@ -551,7 +648,10 @@ describe("recovery helper argument forwarding", () => {
     for (const name of scripts) {
       const source = fs.readFileSync(path.join(scriptsRoot, name), "utf8");
       expect(source, name).not.toMatch(/Invoke-C2C(?:Json)?\s+[^\r\n]*\s-w\s/);
-      if (name !== "_common.ps1") expect(source, name).toContain("--workspace");
+      if (name !== "_common.ps1") {
+        expect(source, name).toContain("--workspace");
+        expect(source, name).toContain("TargetProfile");
+      }
     }
   });
 
@@ -1117,7 +1217,7 @@ describe("safe process probe and recovery planning", () => {
     const encoded = Buffer.from(JSON.stringify(input), "utf8").toString("base64");
     const result = runCli(["recovery-plan", "--workspace", root, "--new-run", "--facts-base64", encoded, "--json"]);
     expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toMatchObject({
+    expect(JSON.parse(result.stdout), result.stdout).toMatchObject({
       ok: true,
       state: "LOCAL_HEALTH_PASS",
       nextAction: "COMPARE_ENDPOINT",
@@ -1130,7 +1230,7 @@ describe("safe process probe and recovery planning", () => {
     const encoded = Buffer.from(JSON.stringify(facts({ bridgeStatus: "stopped", doctor: undefined, localProbe: deniedProbe })), "utf8").toString("base64");
     const escalation = runCli(["recovery-plan", "--facts-base64", encoded, "--json"]);
     expect(escalation.status).not.toBe(0);
-    expect(escalation.stderr).toContain("--workspace");
+    expect(escalation.stderr).toContain("--target-profile");
 
     const pairingFacts = facts({
       phase: "WAIT_PAIR_CODE_GENERATION",
@@ -1139,16 +1239,16 @@ describe("safe process probe and recovery planning", () => {
     });
     const pairing = runCli(["recovery-plan", "--facts-base64", Buffer.from(JSON.stringify(pairingFacts), "utf8").toString("base64"), "--json"]);
     expect(pairing.status).not.toBe(0);
-    expect(pairing.stderr).toContain("--workspace");
+    expect(pairing.stderr).toContain("--target-profile");
 
     const pairingEncoded = Buffer.from(JSON.stringify(pairingFacts), "utf8").toString("base64");
     for (const workspace of ["", "   "]) {
       const unscopedEscalation = runCli(["recovery-plan", "--workspace", workspace, "--facts-base64", encoded, "--json"]);
       expect(unscopedEscalation.status).not.toBe(0);
-      expect(unscopedEscalation.stdout + unscopedEscalation.stderr).toMatch(/non-empty path|workspace argument|requires an argument/i);
+      expect(unscopedEscalation.stdout + unscopedEscalation.stderr).toContain("--target-profile");
       const unscopedPairing = runCli(["recovery-plan", "--workspace", workspace, "--facts-base64", pairingEncoded, "--json"]);
       expect(unscopedPairing.status).not.toBe(0);
-      expect(unscopedPairing.stdout + unscopedPairing.stderr).toMatch(/non-empty path|workspace argument|requires an argument/i);
+      expect(unscopedPairing.stdout + unscopedPairing.stderr).toContain("--target-profile");
     }
   });
 
@@ -1225,7 +1325,10 @@ describe("safe process probe and recovery planning", () => {
     const uninitialized = runCli(["recovery-plan", "--workspace", root, "--facts-base64", encode(initialFacts), "--json"]);
     expect(JSON.parse(uninitialized.stdout).state).toBe("BLOCKED_STATE_INCONSISTENT");
     const initial = runCli(["recovery-plan", "--workspace", root, "--new-run", "--facts-base64", encode(initialFacts), "--json"]);
-    expect(JSON.parse(initial.stdout).state).toBe("HUMAN_MCP_APP_GATE");
+    expect(JSON.parse(initial.stdout).state, initial.stdout).toBe("HUMAN_MCP_APP_GATE");
+    expect(readRecoveryProgress(new Workspace(root).id)?.targetBinding).toMatchObject({
+      profileId: "test-target", workspaceId: new Workspace(root).id, workspaceRoot: fs.realpathSync.native(root), stateDir: path.resolve(stateDir),
+    });
 
     const staleEvent = runCli(["recovery-plan", "--workspace", root, "--facts-base64", encode({
       ...initialFacts, recoveryState: "WAIT_PAIR_CODE_GENERATION", transitionEvent: "PAIRING_PAGE_OPENED",
@@ -1236,6 +1339,62 @@ describe("safe process probe and recovery planning", () => {
       ...initialFacts, recoveryState: "HUMAN_MCP_APP_GATE", transitionEvent: "PAIRING_PAGE_OPENED",
     }), "--json"]);
     expect(JSON.parse(validEvent.stdout).state).toBe("WAIT_PAIR_CODE_GENERATION");
+  });
+
+  it.each(["profileId", "workspaceId", "workspaceRoot", "stateDir"])(
+    "blocks a recovery transition when persisted target binding %s differs",
+    (field) => {
+      const stateDir = isolateStateDir();
+      tempDirs.push(stateDir);
+      const root = makeTmpDir("recovery-target-binding-mismatch");
+      tempDirs.push(root);
+      write(root, "README.md", "fixture workspace\n");
+      const workspace = new Workspace(root);
+      const expectedBinding = {
+        profileId: "project-b",
+        workspaceId: workspace.id,
+        workspaceRoot: fs.realpathSync.native(root),
+        stateDir: path.resolve(stateDir),
+      };
+      const replacement: Record<string, string> = {
+        profileId: "project-a",
+        workspaceId: "000000000000",
+        workspaceRoot: path.join(root, "other-workspace"),
+        stateDir: path.join(stateDir, "other-state"),
+      };
+      const storedBinding = { ...expectedBinding, [field]: replacement[field] };
+      writeRecoveryProgress(workspace.id, {
+        state: "LOCAL_DIAGNOSIS", capableContextAttempted: false, bridgeRestartAttempted: false,
+        targetBinding: storedBinding as typeof expectedBinding,
+      });
+      const progressPath = recoveryProgressFile(workspace.id);
+      const before = fs.readFileSync(progressPath, "utf8");
+      const input = facts({ workspace: { workspaceId: workspace.id, name: workspace.name } });
+      const result = runCli([
+        "recovery-plan", "--target-profile", "project-b", "--workspace", root, "--new-run",
+        "--facts-base64", Buffer.from(JSON.stringify(input), "utf8").toString("base64"), "--json",
+      ], { ...process.env, C2C_STATE_DIR: stateDir });
+
+      expect(JSON.parse(result.stdout.trim()).state).toBe("BLOCKED_STATE_INCONSISTENT");
+      expect(fs.readFileSync(progressPath, "utf8")).toBe(before);
+    },
+  );
+
+  it("blocks before writing when the supplied workspace assertion differs from the profile", () => {
+    const stateDir = isolateStateDir();
+    tempDirs.push(stateDir);
+    const profileRoot = makeTmpDir("recovery-target-profile-root");
+    const wrongRoot = makeTmpDir("recovery-target-wrong-root");
+    tempDirs.push(profileRoot, wrongRoot);
+    const profileHome = makeRecoveryProfileHome(profileRoot, stateDir, "project-a");
+    const factsValue = facts({ workspace: { workspaceId: new Workspace(profileRoot).id, name: "Profile A" } });
+    const result = runCliUnprepared([
+      "recovery-plan", "--target-profile", "project-a", "--workspace", wrongRoot, "--new-run",
+      "--facts-base64", Buffer.from(JSON.stringify(factsValue), "utf8").toString("base64"), "--json",
+    ], { ...process.env, USERPROFILE: profileHome, HOME: profileHome, C2C_STATE_DIR: stateDir });
+
+    expect(JSON.parse(result.stdout.trim())).toMatchObject({ state: "BLOCKED_STATE_INCONSISTENT", facts: { reason: "RECOVERY_TARGET_BINDING_MISMATCH" } });
+    expect(fs.existsSync(path.join(stateDir, "recovery-progress", `${encodeURIComponent(new Workspace(profileRoot).id).replaceAll("%", "_")}.json`))).toBe(false);
   });
 
   it("blocks and persists Connector identity drift after pairing before final verification", () => {

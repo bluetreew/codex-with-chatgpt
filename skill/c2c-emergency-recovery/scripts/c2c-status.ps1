@@ -1,5 +1,6 @@
 param(
-    [string]$WorkspacePath = (Get-Location).Path,
+    [Parameter(Mandatory = $true)][string]$TargetProfile,
+    [string]$WorkspacePath = "",
     [string]$StateDir = "",
     [string]$C2cJs = "",
     [ValidateSet("standard", "capable")][string]$RunContext = "standard",
@@ -19,13 +20,13 @@ param(
     [switch]$AuthorizeRestart
 )
 
-. "$PSScriptRoot\_common.ps1" -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs
+. "$PSScriptRoot\_common.ps1" -TargetProfile $TargetProfile -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs
 
 $sessionResult = Invoke-C2CJson -C2CArgs @('session', '--workspace', $WorkspacePath, '--json')
 $workspace = Invoke-C2CJson -C2CArgs @('workspace', '--workspace', $WorkspacePath, '--json')
 $bridgeStatus = Invoke-C2CJson -C2CArgs @('status', '--workspace', $WorkspacePath, '--json')
 $doctor = Invoke-C2CJson -C2CArgs @('doctor', '--workspace', $WorkspacePath, '--no-fix', '--json')
-$probe = Invoke-C2CJson -C2CArgs @('recovery-probe', '--workspace', $WorkspacePath, '--json')
+$probe = Invoke-C2CJson -C2CArgs @('recovery-probe', '--target-profile', $TargetProfile, '--workspace', $WorkspacePath, '--json')
 
 $facts = [ordered]@{
     workspace = [ordered]@{ workspaceId = $workspace.workspaceId; name = $workspace.name }
@@ -62,7 +63,7 @@ $plan = $null
 for ($stepIndex = 0; $stepIndex -lt 3; $stepIndex++) {
     $factsJson = ConvertTo-Json -InputObject $facts -Depth 30 -Compress
     $factsBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($factsJson))
-    $planArgs = @('recovery-plan', '--workspace', $WorkspacePath, '--facts-base64', $factsBase64, '--json')
+    $planArgs = @('recovery-plan', '--target-profile', $TargetProfile, '--workspace', $WorkspacePath, '--facts-base64', $factsBase64, '--json')
     if ($StartNewRecovery -and $stepIndex -eq 0) { $planArgs += '--new-run' }
     if ($AuthorizeRestart -and $stepIndex -eq 0) { $planArgs += '--authorize-restart' }
     $plan = Invoke-C2CJson -C2CArgs $planArgs
@@ -77,6 +78,7 @@ for ($stepIndex = 0; $stepIndex -lt 3; $stepIndex++) {
     nextAction = $plan.nextAction
     humanActionRequired = $plan.humanActionRequired
     workspace = $facts.workspace
+    targetBinding = $plan.facts.targetBinding
     session = $facts.session
     bridge = $doctor.report.bridge
     localMcp = $doctor.report.mcp

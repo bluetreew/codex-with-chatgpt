@@ -5,5 +5,5 @@ param(
     [Parameter(Mandatory = $true)][string]$StateDir
 )
 
-. $CommonScript -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $FakeC2cJs
+. $CommonScript -TargetProfile 'smoke-target' -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $FakeC2cJs
 Invoke-C2C -C2CArgs @('status', '--workspace', $WorkspacePath, '--json')

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const fixturePath = process.env.C2C_TEST_RECOVERY_FIXTURE;
@@ -12,8 +13,21 @@ const persist = () => fs.writeFileSync(fixturePath, JSON.stringify(fixture));
 const emit = (value) => process.stdout.write(JSON.stringify(value));
 const command = args[0];
 
-if (command === "session" && args[1] !== "set") emit({ session: fixture.session });
-else if (command === "workspace") emit({ workspaceId: "fixture-workspace", name: "Fixture Workspace" });
+if (command === "control-target" && args[1] === "resolve") {
+  const targetWorkspaceRoot = fs.realpathSync(path.resolve(process.env.C2C_PROFILE_RESOLVE_WORKSPACE));
+  const normalizedRoot = process.platform === "win32" || process.platform === "darwin" ? targetWorkspaceRoot.toLowerCase() : targetWorkspaceRoot;
+  emit({
+    ok: true,
+    profile: {
+      profileId: args[args.indexOf("--profile") + 1],
+      targetWorkspaceRoot,
+      targetStateDir: process.env.C2C_PROFILE_RESOLVE_STATE || process.env.C2C_STATE_DIR,
+      workspaceId: createHash("sha256").update(normalizedRoot).digest("hex").slice(0, 12),
+    },
+  });
+}
+else if (command === "session" && args[1] !== "set") emit({ session: fixture.session });
+else if (command === "workspace") emit({ workspaceId: process.env.C2C_RECOVERY_WORKSPACE_ID || "fixture-workspace", name: "Fixture Workspace" });
 else if (command === "status") emit({ ok: true, running: true });
 else if (command === "doctor") emit(fixture.doctor);
 else if (command === "recovery-probe") emit(fixture.probe);

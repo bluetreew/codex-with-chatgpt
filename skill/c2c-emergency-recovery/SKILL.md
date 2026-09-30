@@ -24,18 +24,23 @@ Follow the returned `state` and `nextAction`; do not infer a different path.
 
 ## Isolated CONTROL bootstrap
 
-CONTROL bootstrap is separate from TARGET/MOZI recovery. For this machine use:
+CONTROL bootstrap is separate from target recovery. The built-in `mozi` target
+profile preserves the original binding; additional targets are registered and
+resolved by profile id.
 
 ```text
-CONTROL workspace: D:\app_home\codex-with-chatgpt
-CONTROL state: <canonical user home>\.codex\c2c-repair-control-state
-TARGET workspace: D:\workshop\职业教育-MOZI
-TARGET state: D:\app_home\codex-with-chatgpt-state
+profileId
+workspaceId
+workspaceRoot
+stateDir
 ```
 
-Set `C2C_STATE_DIR` to the CONTROL state path for every CONTROL helper call and
-pass both TARGET paths as identity guards. Never read or write TARGET session,
-runtime, recovery progress, or Project files from this flow.
+Every recovery run binds progress to all four values and rechecks them on each
+transition. PowerShell wrappers require `-TargetProfile <id>`; optional
+workspace/state arguments are assertions against the profile. The wrappers set
+`C2C_STATE_DIR` from the resolved target profile and have no workspace-specific
+fallback. Never read or write another profile's session, runtime, recovery
+progress, or Project files.
 
 Use the hidden `c2c control-bootstrap` helper for local readiness. It performs
 an effective state-directory create/read/delete probe, checks the local process
@@ -66,8 +71,7 @@ $env:C2C_STATE_DIR = Join-Path (Join-Path $canonicalHome '.codex') 'c2c-repair-c
 node 'D:\app_home\codex-with-chatgpt\bin\c2c.js' control-bootstrap `
   --workspace 'D:\app_home\codex-with-chatgpt' `
   --control-state-dir $env:C2C_STATE_DIR `
-  --target-workspace 'D:\workshop\职业教育-MOZI' `
-  --target-state-dir 'D:\app_home\codex-with-chatgpt-state' --json
+  --target-profile mozi --json
 ```
 
 Only the single retry adds `--capable-context-retry` and uses the Codex
@@ -101,24 +105,26 @@ The structured helper may instead return `BLOCKED_LOCAL_EXECUTION`,
 
 ## Procedure
 
-1. Resolve the current workspace, canonical `C2C_STATE_DIR`, and installed C2C
-   CLI from known paths/environment only. First run `scripts/c2c-status.ps1`
-   without `-StartNewRecovery` so any existing progress is resumed. Only if the
+1. Select a target with `c2c control-target list --json`, then resolve it with
+   `c2c control-target resolve --profile <id> --json`. Resolve the installed
+   C2C CLI from known paths/environment only. Pass `-TargetProfile <id>` to
+   every recovery wrapper. First run `scripts/c2c-status.ps1` without
+   `-StartNewRecovery` so matching progress is resumed. Only if the
    result explicitly says there is no active recovery run, start one with
-   `scripts/c2c-status.ps1 -StartNewRecovery`. In particular, an existing
+   `scripts/c2c-status.ps1 -TargetProfile <id> -StartNewRecovery`. In particular, an existing
    `BLOCKED_BRIDGE_UNKNOWN` run is re-evaluated in place from fresh Bridge
-   evidence; never replace it with a new run. The run state and one-escalation
-   flag are stored separately under the C2C state directory; the C2C session
-   schema remains unchanged.
+   evidence; never replace it with a new run. The stored binding includes
+   profile id, workspace id, canonical workspace root, and state directory.
+   The C2C session schema remains unchanged.
 2. Follow `nextAction`. For `REPLACE_LEGACY_BRIDGE_ONCE`, require authenticated
    `/admin/info` success, probe HTTP 404, local process capability `CAPABLE`,
    unhealthy Tunnel, an unchanged session snapshot, and no prior Bridge replacement.
-   Run `scripts/c2c-start-tunnel.ps1 -Action migrate-legacy` once. The helper stops
+   Run `scripts/c2c-start-tunnel.ps1 -TargetProfile <id> -Action migrate-legacy` once. The helper stops
    only the verified managed Bridge, starts the current runtime, rechecks `/admin/info`
    and `/admin/recovery-probe`, and verifies the protected session before continuing
    through the normal Tunnel path. If the replacement still lacks a structured probe
    or any check fails, report the blocked state and stop. Never retry replacement.
-   Use `scripts/c2c-start-tunnel.ps1` only for `START_BRIDGE_AND_TUNNEL` or
+   Use `scripts/c2c-start-tunnel.ps1 -TargetProfile <id>` only for `START_BRIDGE_AND_TUNNEL` or
    `START_TUNNEL`. Use its `restart` action only
    when the existing Bridge probe classifies `RESTRICTED_BRIDGE_CONTEXT` and
    local probe classifies `CAPABLE`. Snapshot the session before and after any
@@ -142,13 +148,13 @@ The structured helper may instead return `BLOCKED_LOCAL_EXECUTION`,
 5. Carry the planner's `state` into each next `c2c-status.ps1` call as
    `-RecoveryState`; the stored run state must also match. After `配对页已打开`,
    submit `PAIRING_PAGE_OPENED`; only `WAIT_PAIR_CODE_GENERATION` permits
-   `scripts/c2c-pair.ps1 -RecoveryState WAIT_PAIR_CODE_GENERATION`. The helper
+   `scripts/c2c-pair.ps1 -TargetProfile <id> -RecoveryState WAIT_PAIR_CODE_GENERATION`. The helper
    validates before creating a code, records `PAIR_CODE_GENERATED`, and returns
    `WAIT_PAIRING_COMPLETE`. If code generation fails, it records terminal
    `LOCAL_RECOVERY_FAILED`; begin a new diagnosed recovery before trying again.
    After `配对完成，Connector 名为：<name>`, submit
    `PAIRING_COMPLETED` with that name; only `AI_CONFIRM_CONNECTOR` permits
-   `scripts/c2c-confirm.ps1 -RecoveryState AI_CONFIRM_CONNECTOR`. It validates
+   `scripts/c2c-confirm.ps1 -TargetProfile <id> -RecoveryState AI_CONFIRM_CONNECTOR`. It validates
    the requested MCP URL against the doctor endpoint before changing session
    or endpoint metadata, then records
    `CONNECTOR_CONFIRMED` and returns `POST_RECOVERY_VERIFY`.
