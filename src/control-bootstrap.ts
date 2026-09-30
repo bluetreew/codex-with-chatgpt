@@ -203,6 +203,8 @@ const states: readonly ControlBootstrapState[] = [
   "CONTROL_BOOTSTRAP_BLOCKED",
 ];
 
+const stateWriteHandoffsOffered = new Set<string>();
+
 function hasDotSegments(value: string): boolean {
   return value.split(/[\\/]+/).some((segment) => segment === "." || segment === "..");
 }
@@ -428,7 +430,29 @@ export async function runControlBootstrap(
   if (isolationError) return resultBlocked(emptyProbe, false, isolationError);
 
   const stateDirectoryWriteProbe = adapter.stateDirectoryWriteProbe(input.controlStateDir);
-  if (!stateDirectoryWriteProbe.ok) return resultBlocked(stateDirectoryWriteProbe, false, "CONTROL_STATE_NOT_WRITABLE");
+  if (!stateDirectoryWriteProbe.ok) {
+    const failureCode = stateDirectoryWriteProbe.failureCode ?? "";
+    const permissionDenied = failureCode === "EPERM" || failureCode === "EACCES";
+    if (permissionDenied && !input.capableContextRetry) {
+      const handoffKey = canonicalControlStatePath(input.controlStateDir, input.controlStateDir) ?? path.resolve(input.controlStateDir);
+      if (stateWriteHandoffsOffered.has(handoffKey)) {
+        return resultBlocked(stateDirectoryWriteProbe, false, "CAPABLE_CONTEXT_HANDOFF_ALREADY_OFFERED");
+      }
+      stateWriteHandoffsOffered.add(handoffKey);
+      return {
+        ok: false,
+        state: "CONTROL_CAPABLE_CONTEXT_REQUIRED",
+        nextAction: "RETRY_CAPABLE_CONTEXT",
+        capableContextAttempted: false,
+        stateDirectoryWriteProbe,
+        reason: "CONTROL_STATE_WRITE_PERMISSION_DENIED",
+      };
+    }
+    if (permissionDenied && input.capableContextRetry) {
+      return resultBlocked(stateDirectoryWriteProbe, true, "CAPABLE_CONTEXT_STATE_WRITE_FAILED");
+    }
+    return resultBlocked(stateDirectoryWriteProbe, input.capableContextRetry, "CONTROL_STATE_NOT_WRITABLE");
+  }
 
   let progress: ControlBootstrapProgress | null;
   try { progress = readControlBootstrapProgress(input.controlStateDir, input.workspaceId); }
@@ -440,6 +464,22 @@ export async function runControlBootstrap(
     consumed = retryMarkerExists(input.controlStateDir, "consumed");
   } catch {
     return resultBlocked(stateDirectoryWriteProbe, false, "CAPABLE_CONTEXT_MARKER_READ_FAILED");
+  }
+  // The ordinary-context state-write failure cannot persist its normal handoff marker.
+  // Once the capable retry proves the same canonical directory is writable, materialize
+  // the existing one-shot marker/progress pair before accepting the retry.
+  if (input.capableContextRetry && !progress && !offered && !consumed) {
+    const marker = createControlBootstrapRetryMarker(input.controlStateDir, "offered");
+    if (marker !== "CREATED") {
+      return resultBlocked(stateDirectoryWriteProbe, false, marker === "ALREADY_EXISTS"
+        ? "CAPABLE_CONTEXT_HANDOFF_ALREADY_OFFERED"
+        : "CAPABLE_CONTEXT_MARKER_WRITE_FAILED");
+    }
+    offered = true;
+    const writeRetryProgress = progressFor(input, "CONTROL_CAPABLE_CONTEXT_REQUIRED", false, "CONTROL_STATE_WRITE_PERMISSION_DENIED");
+    progress = writeRetryProgress;
+    try { writeControlBootstrapProgress(input.controlStateDir, writeRetryProgress); }
+    catch { return resultBlocked(stateDirectoryWriteProbe, false, "CONTROL_BOOTSTRAP_PROGRESS_WRITE_FAILED"); }
   }
   if ((offered && !progress) ||
       (progress?.state === "CONTROL_CAPABLE_CONTEXT_REQUIRED" && !offered) ||

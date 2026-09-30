@@ -435,22 +435,90 @@ describe("CONTROL bootstrap capable execution handoff", () => {
     expect(deps.startBridge).not.toHaveBeenCalled();
   });
 
-  it("blocks an unapproved or repeated retry flag", async () => {
+  it.each(["EPERM", "EACCES"] as const)("offers exactly one capable handoff for a state write %s", async (failureCode) => {
     const { input } = fixture();
-    const deps = adapter(input);
-    const result = await runControlBootstrap({ ...input, capableContextRetry: true }, deps);
-    expect(result).toMatchObject({ state: "CONTROL_BOOTSTRAP_BLOCKED", reason: "CAPABLE_CONTEXT_RETRY_NOT_AUTHORIZED" });
+    const deps = adapter(input, {
+      writeProbe: { ok: false, created: false, readBack: false, deleted: false, failureCode },
+    });
+    const [first, duplicate] = await Promise.all([
+      runControlBootstrap(input, deps),
+      runControlBootstrap(input, deps),
+    ]);
+
+    expect([first, duplicate].filter((result) => result.nextAction === "RETRY_CAPABLE_CONTEXT")).toHaveLength(1);
+    expect([first, duplicate].find((result) => result.nextAction === "RETRY_CAPABLE_CONTEXT")).toMatchObject({
+      state: "CONTROL_CAPABLE_CONTEXT_REQUIRED",
+      capableContextAttempted: false,
+      reason: "CONTROL_STATE_WRITE_PERMISSION_DENIED",
+    });
+    expect([first, duplicate].find((result) => result.nextAction === "CONTROL_BOOTSTRAP_BLOCKED")?.reason)
+      .toBe("CAPABLE_CONTEXT_HANDOFF_ALREADY_OFFERED");
     expect(deps.localProbe).not.toHaveBeenCalled();
+    expect(deps.findBridge).not.toHaveBeenCalled();
     expect(deps.startBridge).not.toHaveBeenCalled();
   });
 
-  it("blocks if effective AppData state write probe fails before process probes", async () => {
+  it("continues bootstrap when the capable-context retry passes the same state write probe", async () => {
     const { input } = fixture();
-    const deps = adapter(input, { writeProbe: { ok: false, created: false, readBack: false, deleted: false, failureCode: "EACCES" } });
+    const deps = adapter(input);
+    deps.stateDirectoryWriteProbe = vi.fn()
+      .mockReturnValueOnce({ ok: false, created: false, readBack: false, deleted: false, failureCode: "EPERM" })
+      .mockImplementation(() => probeControlStateDirectoryWrite(input.controlStateDir));
+
+    const ordinary = await runControlBootstrap(input, deps);
+    const capableRetry = await runControlBootstrap({ ...input, capableContextRetry: true }, deps);
+
+    expect(ordinary.nextAction).toBe("RETRY_CAPABLE_CONTEXT");
+    expect(capableRetry).toMatchObject({
+      ok: true,
+      state: "CONTROL_BRIDGE_READY",
+      nextAction: "CONTROL_LOCAL_HEALTH_GATE",
+      capableContextAttempted: true,
+      stateDirectoryWriteProbe: { ok: true, created: true, readBack: true, deleted: true },
+    });
+    expect(deps.stateDirectoryWriteProbe).toHaveBeenCalledTimes(2);
+    expect(fs.existsSync(input.controlStateDir)).toBe(true);
+    expect(deps.startBridge).not.toHaveBeenCalled();
+
+    const secondRetry = await runControlBootstrap({ ...input, capableContextRetry: true }, deps);
+    expect(secondRetry).toMatchObject({ state: "CONTROL_BOOTSTRAP_BLOCKED", reason: "CAPABLE_CONTEXT_RETRY_NOT_AUTHORIZED" });
+    expect(deps.stateDirectoryWriteProbe).toHaveBeenCalledTimes(3);
+  });
+
+  it("fails closed when capable-context state write retry still returns EPERM or EACCES", async () => {
+    for (const failureCode of ["EPERM", "EACCES"] as const) {
+      const { input } = fixture();
+      const deps = adapter(input, {
+        writeProbe: { ok: false, created: false, readBack: false, deleted: false, failureCode },
+      });
+
+      const ordinary = await runControlBootstrap(input, deps);
+      const capableRetry = await runControlBootstrap({ ...input, capableContextRetry: true }, deps);
+
+      expect(ordinary.nextAction).toBe("RETRY_CAPABLE_CONTEXT");
+      expect(capableRetry).toMatchObject({
+        state: "CONTROL_BOOTSTRAP_BLOCKED",
+        nextAction: "CONTROL_BOOTSTRAP_BLOCKED",
+        capableContextAttempted: true,
+        reason: "CAPABLE_CONTEXT_STATE_WRITE_FAILED",
+      });
+      expect(deps.localProbe).not.toHaveBeenCalled();
+      expect(deps.findBridge).not.toHaveBeenCalled();
+      expect(deps.startBridge).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps non-permission state write errors blocked", async () => {
+    const { input } = fixture();
+    const deps = adapter(input, {
+      writeProbe: { ok: false, created: false, readBack: false, deleted: false, failureCode: "ENOSPC" },
+    });
     const result = await runControlBootstrap(input, deps);
     expect(result).toMatchObject({ state: "CONTROL_BOOTSTRAP_BLOCKED", reason: "CONTROL_STATE_NOT_WRITABLE" });
+    expect(result.nextAction).toBe("CONTROL_BOOTSTRAP_BLOCKED");
     expect(deps.localProbe).not.toHaveBeenCalled();
     expect(deps.findBridge).not.toHaveBeenCalled();
+    expect(deps.startBridge).not.toHaveBeenCalled();
   });
 
   it("starts a stopped CONTROL Bridge only after local capability passes, then verifies Bridge-side probe", async () => {
