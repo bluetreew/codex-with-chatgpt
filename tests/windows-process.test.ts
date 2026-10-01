@@ -78,20 +78,24 @@ describe("Windows background subprocess windowsHide: true (RED verification)", (
   });
 
   it("4. findBinary in src/tunnel/detect.ts passes windowsHide: true for binary probe", () => {
+    const previous = process.env.C2C_CLOUDFLARED_PATH;
+    delete process.env.C2C_CLOUDFLARED_PATH;
     findBinary("cloudflared");
+    if (previous !== undefined) process.env.C2C_CLOUDFLARED_PATH = previous;
     const probeCall = spawnSyncCalls.find((c) => Array.isArray(c.args) && c.args[0] === "--version");
     expect(probeCall).toBeDefined();
     expect(probeCall?.options).toHaveProperty("windowsHide", true);
   });
 
   it("5. ProcessCloudflaredAccount.run in src/tunnel/named-provision.ts passes windowsHide: true", async () => {
-    const account = new ProcessCloudflaredAccount("fake-cloudflared");
+    const executable = path.resolve("fake-cloudflared");
+    const account = new ProcessCloudflaredAccount(executable);
     try {
       await account.listTunnels();
     } catch {
       // Expected to fail execution, but spawnSync should record call
     }
-    const provisionCall = spawnSyncCalls.find((c) => c.file === "fake-cloudflared");
+    const provisionCall = spawnSyncCalls.find((c) => c.file === executable);
     expect(provisionCall).toBeDefined();
     expect(provisionCall?.options).toHaveProperty("windowsHide", true);
   });

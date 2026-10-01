@@ -4,11 +4,12 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
+import { reconcileLegacyControlRuntime } from "../bridge/legacy-control-runtime.js";
 import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
-import { detectTunnelBinaries } from "../tunnel/detect.js";
+import { detectTunnelBinaries, findBinary } from "../tunnel/detect.js";
 import {
   chooseQuickTunnel,
   hasCloudflaredCert,
@@ -16,6 +17,7 @@ import {
   namedTunnelCredentialRepairMessage,
   ProcessCloudflaredAccount,
   provisionNamedTunnel,
+  resolveNamedProvisionExecutable,
 } from "../tunnel/named-provision.js";
 import { parseZoneInput, suggestedNamedHostname } from "../tunnel/hostname.js";
 import {
@@ -27,7 +29,12 @@ import {
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
-import { getStateDir } from "../config/paths.js";
+import { controlTargetRegistryFile, getStateDir, managedCloudflaredDirectory, readJsonIfExists } from "../config/paths.js";
+import { ControlTargetRegistryError, listControlTargetProfiles, registerControlTargetProfile, resolveControlTargetProfile } from "../config/control-target-registry.js";
+import { ControlTargetSelectionError, selectControlTargetProfile } from "../control-target-selection.js";
+import { recoveryTargetBindingFromProfile, matchRecoveryTargetBinding } from "../recovery/target-binding.js";
+import { networkProfileFile, readNetworkProfile, writeNetworkProfile } from "../config/network-profile.js";
+import { ProxyAgent, fetch as proxyFetch } from "undici";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
@@ -35,6 +42,8 @@ import {
   CHATGPT_DEVELOPER_MODE_URL,
   CHATGPT_PLUGINS_URL,
   connectorAction,
+  confirmedConnectorUrl,
+  confirmConnector,
   connectorNameFor,
   mcpUrlFromPublic,
   normalizePublicUrl,
@@ -59,6 +68,26 @@ import {
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { importMediaAsset } from "../media/import.js";
+import { formatArtifactSyncReceipt, materializeArtifact, parseArtifactBundle, validateArtifactTargets } from "../artifact-sync.js";
+import { planRecovery, snapshotRecoverySession, type RecoveryFacts } from "../recovery/harness.js";
+import { observeBridgeRecoveryProbe, probeExecutionContext, type BridgeProbeObservation } from "../recovery/probe.js";
+import { legacyMigrationEligibility, replaceLegacyBridgeOnce, resumeBlockedBridgeUnknownAsLegacy } from "../recovery/legacy-migration.js";
+import {
+  consumeLegacyBridgeReplacementMarker,
+  createRecoveryRunId,
+  readRecoveryProgress,
+  writeRecoveryProgress,
+} from "../recovery/state.js";
+import {
+  APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
+  createControlBootstrapCliAdapter,
+  probeControlStateDirectoryWrite,
+  runControlBootstrap,
+  isApprovedControlWorkspaceRoot,
+  validateControlBootstrapControlIdentity,
+  resolveTunnelPrecheckCloudflared,
+  validateControlBootstrapIsolation,
+} from "../control-bootstrap.js";
 
 const program = new Command();
 
@@ -70,6 +99,58 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+function resolveRecoveryTarget(profileId: string, workspaceArgument?: string) {
+  const profile = resolveControlTargetProfile(profileId, {
+    registryFile: controlTargetRegistryFile(),
+    controlWorkspaceRoot: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot,
+    controlStateDir: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir,
+  });
+  const workspace = new Workspace(profile.targetWorkspaceRoot);
+  if (workspace.id !== profile.workspaceId ||
+      (workspaceArgument !== undefined && !sameCanonicalPath(resolveWorkspace(workspaceArgument), profile.targetWorkspaceRoot))) {
+    throw new Error("RECOVERY_TARGET_BINDING_MISMATCH");
+  }
+  process.env.C2C_STATE_DIR = profile.targetStateDir;
+  return { profile, binding: recoveryTargetBindingFromProfile(profile), workspace };
+}
+
+function sameCanonicalPath(left: string, right: string): boolean {
+  const resolvedLeft = path.resolve(left);
+  const resolvedRight = path.resolve(right);
+  return process.platform === "win32" || process.platform === "darwin"
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    : resolvedLeft === resolvedRight;
+}
+
+function cloudflaredAccountForWorkspace(workspaceRoot: string): ProcessCloudflaredAccount {
+  const controlWorkspace = isApprovedControlWorkspaceRoot(workspaceRoot);
+  const executable = resolveNamedProvisionExecutable({
+    controlWorkspace,
+    ...(controlWorkspace ? { managedCloudflaredDirectory: managedCloudflaredDirectory() } : {}),
+    ...(controlWorkspace ? {} : { discoveredExecutable: findBinary("cloudflared") }),
+  });
+  if (executable.status === "NOT_CONFIGURED") {
+    throw new Error("NEED_CLOUDFLARED: no executable is available in the approved location");
+  }
+  if (executable.status === "UNAPPROVED_CLOUDFLARED_PATH") {
+    throw new Error("UNAPPROVED_CLOUDFLARED_PATH: named provisioning requires the approved managed executable");
+  }
+  return new ProcessCloudflaredAccount(executable.path);
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
 }
 
 function parseInteger(value: string): number {
@@ -135,6 +216,10 @@ function persistWorkspaceEndpoint(opts: {
     publicUrl: opts.publicUrl,
     mcpUrl: opts.mcpUrl,
     connectorName,
+    connectorConfirmedMcpUrl: confirmedConnectorUrl(previous),
+    connectorNeedsUpdate: Boolean(previous?.connectorNeedsUpdate) || Boolean(
+      previous?.mcpUrl && normalizePublicUrl(previous.mcpUrl) !== normalizePublicUrl(opts.mcpUrl)
+    ),
   });
   return connectorName;
 }
@@ -200,8 +285,14 @@ async function ensureBridgeAndTunnel(
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
   if (opts.tunnel && !info.publicUrl) {
-    const binaries = detectTunnelBinaries();
-    if (!binaries.cloudflared) {
+    const profile = readNetworkProfile(info.workspaceId);
+    const binary = resolveTunnelPrecheckCloudflared({
+      workspaceRoot,
+      profileCandidate: profile?.cloudflaredPath,
+      managedCloudflaredDirectory: managedCloudflaredDirectory(),
+      discoverGeneric: () => detectTunnelBinaries().cloudflared,
+    });
+    if (!binary) {
       throw new Error(
         "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
       );
@@ -220,6 +311,131 @@ program
   .version(VERSION, "-v, --version")
   .configureHelp({ sortSubcommands: true });
 
+const controlTargetCmd = program.command("control-target").description("Manage CONTROL recovery target profiles");
+
+controlTargetCmd
+  .command("list")
+  .description("List the built-in and registered target profiles without changing state")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    try {
+      const registryFile = controlTargetRegistryFile();
+      const profiles = listControlTargetProfiles({ registryFile });
+      const payload = { ok: true, registryFile, profiles };
+      if (opts.json) say(JSON.stringify(payload));
+      else {
+        for (const profile of profiles) say(`${profile.profileId} — ${profile.targetWorkspaceRoot}`);
+      }
+    } catch (error) {
+      const code = error instanceof ControlTargetRegistryError ? error.code : "CONTROL_TARGET_REGISTRY_INVALID";
+      const message = error instanceof Error ? error.message : String(error);
+      if (opts.json) say(JSON.stringify({ ok: false, code, error: message }));
+      else cross(message);
+      process.exitCode = 1;
+    }
+  });
+
+controlTargetCmd
+  .command("resolve")
+  .description("Resolve and validate one registered target profile without starting services")
+  .requiredOption("--profile <id>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { profile: string; json: boolean }) => {
+    try {
+      const registryFile = controlTargetRegistryFile();
+      const profile = resolveControlTargetProfile(opts.profile, {
+        registryFile,
+        controlWorkspaceRoot: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot,
+        controlStateDir: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir,
+      });
+      const payload = { ok: true, registryFile, profile };
+      if (opts.json) say(JSON.stringify(payload));
+      else check(`Resolved ${profile.profileId} (${profile.workspaceId})`);
+    } catch (error) {
+      const code = error instanceof ControlTargetRegistryError ? error.code : "CONTROL_TARGET_REGISTRY_INVALID";
+      const message = error instanceof Error ? error.message : String(error);
+      if (opts.json) say(JSON.stringify({ ok: false, code, error: message }));
+      else cross(message);
+      process.exitCode = 1;
+    }
+  });
+
+controlTargetCmd
+  .command("register")
+  .description("Register a target workspace without creating its state directory or starting services")
+  .requiredOption("--profile <id>")
+  .requiredOption("--workspace <path>")
+  .requiredOption("--state-dir <path>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { profile: string; workspace: string; stateDir: string; json: boolean }) => {
+    try {
+      const registryFile = controlTargetRegistryFile();
+      const profile = registerControlTargetProfile(opts.profile, opts.workspace, opts.stateDir, {
+        registryFile,
+        controlWorkspaceRoot: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot,
+        controlStateDir: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir,
+      });
+      const payload = { ok: true, registryFile, profile };
+      if (opts.json) say(JSON.stringify(payload));
+      else check(`Registered ${profile.profileId} (${profile.workspaceId})`);
+    } catch (error) {
+      const code = error instanceof ControlTargetRegistryError ? error.code : "CONTROL_TARGET_REGISTRY_INVALID";
+      const message = error instanceof Error ? error.message : String(error);
+      if (opts.json) say(JSON.stringify({ ok: false, code, error: message }));
+      else cross(message);
+      process.exitCode = 1;
+    }
+  });
+
+program.command("network")
+  .description("Manage a workspace-local C2C network profile")
+  .requiredOption("-w, --workspace <path>")
+  .option("--proxy-url <url>")
+  .option("--cloudflared-path <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace: string; proxyUrl?: string; cloudflaredPath?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      if (opts.proxyUrl || opts.cloudflaredPath) {
+        if (!opts.proxyUrl || !opts.cloudflaredPath) throw new Error("Both --proxy-url and --cloudflared-path are required");
+        const profile = {
+          proxyUrl: opts.proxyUrl,
+          cloudflaredPath: path.resolve(opts.cloudflaredPath),
+          tunnelProtocol: "http2" as const,
+          quickServiceRelay: true,
+          noProxy: "localhost,127.0.0.1,::1",
+        };
+        if (!fs.existsSync(profile.cloudflaredPath)) throw new Error("cloudflared path does not exist");
+        const proxy = new URL(profile.proxyUrl);
+        if (!["http:", "https:"].includes(proxy.protocol) || !proxy.hostname || !proxy.port || proxy.username || proxy.password) {
+          throw new Error("Proxy URL must be an HTTP(S) loopback endpoint without credentials");
+        }
+        if (!["127.0.0.1", "localhost", "[::1]"].includes(proxy.hostname)) {
+          throw new Error("Proxy URL must use a loopback host");
+        }
+        writeNetworkProfile(workspace.id, profile);
+        await stopBridge(workspace.root);
+      }
+      const profile = readNetworkProfile(workspace.id);
+      if (opts.json) say(JSON.stringify({ ok: true, configured: Boolean(profile), profile }));
+      else say(profile ? "C2C network profile is configured." : "No C2C network profile configured.");
+    } catch (error) { handleCliError(error, opts.json); }
+  });
+
+program.command("connector-confirm")
+  .description("Record that the current ChatGPT connector has been created and authorized")
+  .requiredOption("-w, --workspace <path>")
+  .requiredOption("--mcp-url <url>")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace: string; mcpUrl: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const endpoint = confirmConnector(workspace.id, opts.mcpUrl, readSession(workspace.id)?.connectorName);
+      if (opts.json) say(JSON.stringify({ ok: true, connectorName: endpoint.connectorName, mcpUrl: endpoint.mcpUrl }));
+      else check("ChatGPT connector configuration recorded");
+    } catch (error) { handleCliError(error, opts.json); }
+  });
+
 /** Machine-wide commands ignore `-w` so a Skill that always passes it cannot crash them. */
 function acceptUnusedWorkspaceOption(command: Command): Command {
   return command.option("-w, --workspace <path>", "ignored; this command is machine-wide");
@@ -234,8 +450,9 @@ program
   .option("--port <port>", "preferred port")
   .action(async (opts: { workspace: string; port?: string }) => {
     const logger = new Logger({ name: "bridge", console: true });
+    const workspaceRoot = resolveWorkspace(opts.workspace);
     const bridge = await startBridge({
-      workspaceRoot: resolveWorkspace(opts.workspace),
+      workspaceRoot,
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       logger,
     });
@@ -258,7 +475,9 @@ program
   .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const workspace = new Workspace(root);
+      const resumeTunnel = opts.tunnel || Boolean(readLastEndpoint(workspace.id)?.publicUrl);
+      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: resumeTunnel });
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -369,10 +588,12 @@ program
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
+    const workspace = new Workspace(root);
+    const resumeTunnel = opts.tunnel || Boolean(readLastEndpoint(workspace.id)?.publicUrl);
     await stopBridge(root);
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: resumeTunnel });
       check(`Bridge 已重启（${info.workspaceName}）`);
       if (mcpUrl) check(`安全连接已建立`);
     } catch (error) {
@@ -458,9 +679,12 @@ program
 
     // Workspace
     let workspace: Workspace | null = null;
+    let networkProfile: ReturnType<typeof readNetworkProfile> = null;
     try {
       workspace = new Workspace(root);
       report.workspace = { ok: true, detail: workspace.name };
+      networkProfile = readNetworkProfile(workspace.id);
+      if (networkProfile) report.network = { ok: true, detail: "C2C-local profile loaded" };
     } catch (error) {
       report.workspace = { ok: false, detail: (error as Error).message };
     }
@@ -565,8 +789,18 @@ program
       let healthy = false;
       if (currentUrl) {
         try {
-          const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
-          healthy = response.ok;
+          if (networkProfile) {
+            const agent = new ProxyAgent(networkProfile.proxyUrl);
+            try {
+              const response = await proxyFetch(`${currentUrl}/health`, { dispatcher: agent, signal: AbortSignal.timeout(8000) });
+              healthy = response.ok;
+              await response.body?.cancel();
+            } finally { await agent.close(); }
+          } else {
+            const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
+            healthy = response.ok;
+            await response.body?.cancel();
+          }
         } catch {
           healthy = false;
         }
@@ -574,8 +808,13 @@ program
 
       if ((!currentUrl || !healthy) && !namedCredentialFailure && opts.fix && (expectedPublic || info.tunnel.running)) {
         try {
-          const binaries = detectTunnelBinaries();
-          if (!binaries.cloudflared) {
+          const binary = resolveTunnelPrecheckCloudflared({
+            workspaceRoot: root,
+            profileCandidate: networkProfile?.cloudflaredPath,
+            managedCloudflaredDirectory: managedCloudflaredDirectory(),
+            discoverGeneric: () => detectTunnelBinaries().cloudflared,
+          });
+          if (!binary) {
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
             const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
@@ -606,7 +845,8 @@ program
       } else if (currentUrl && healthy) {
         report.tunnel = { ok: true, detail: currentUrl };
         const nextMcp = mcpUrlFromPublic(currentUrl);
-        const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
+        const action = lastEndpoint?.connectorNeedsUpdate
+          ? "update" : connectorAction(confirmedConnectorUrl(lastEndpoint), nextMcp);
         const boundName = nextMcp
           ? persistWorkspaceEndpoint({
               workspaceId: info.workspaceId,
@@ -619,13 +859,14 @@ program
           : connectorName;
         chatgptRepair = {
           ...chatgptRepair,
-          needed: action === "update",
-          reason: action === "update" ? "address_reclaimed" : undefined,
+          needed: action !== "none",
+          reason: action === "update" ? "address_reclaimed" : action === "create" ? "connector_not_configured" : undefined,
           connectorAction: action,
           connectorName: boundName,
-          userMessage: action === "update" ? reclaimUserMessage(boundName) : undefined,
+          userMessage: action === "update" ? reclaimUserMessage(boundName)
+            : action === "create" ? `请为当前项目添加「${boundName}」连接。` : undefined,
           mcpUrl: nextMcp,
-          previousMcpUrl: lastEndpoint?.mcpUrl ?? null,
+          previousMcpUrl: confirmedConnectorUrl(lastEndpoint),
         };
         if (action === "update") {
           results.push(`安全连接地址已更换，需要更新「${boundName}」`);
@@ -637,11 +878,10 @@ program
         report.tunnel = report.tunnel ?? { ok: false, detail: "安全连接未恢复" };
         chatgptRepair = {
           ...chatgptRepair,
-          needed: true,
-          reason: "address_reclaimed",
-          connectorAction: "update",
+          needed: false,
+          reason: "tunnel_unavailable",
+          connectorAction: "none",
           connectorName,
-          userMessage: reclaimUserMessage(connectorName),
           mcpUrl: null,
         };
       } else if (!currentUrl) {
@@ -667,11 +907,11 @@ program
       report.tunnel = { ok: false, detail: "安全连接未运行" };
       chatgptRepair = {
         ...chatgptRepair,
-        needed: true,
-        reason: "address_reclaimed",
-        connectorAction: "update",
+        needed: false,
+        reason: "tunnel_unavailable",
+        connectorAction: "none",
         connectorName,
-        userMessage: reclaimUserMessage(connectorName),
+        mcpUrl: null,
       };
     }
 
@@ -692,6 +932,7 @@ program
       mcp: "MCP",
       oauth: "OAuth",
       tunnel: "Tunnel",
+      network: "Network",
     };
     let allOk = true;
     for (const [key, value] of Object.entries(report)) {
@@ -724,6 +965,513 @@ program
             : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
     );
     if (!allOk || namedRepair.needed) process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------- isolated CONTROL bootstrap helpers (internal)
+
+program
+  .command("control-bootstrap", { hidden: true })
+  .description("Probe and prepare the isolated CONTROL Bridge without starting a Tunnel")
+  .requiredOption("--workspace <path>")
+  .requiredOption("--control-state-dir <path>")
+  .option("--target-profile <id>")
+  .option("--target-workspace <path>", "legacy; accepted only when exactly matching the built-in MOZI profile")
+  .option("--target-state-dir <path>", "legacy; accepted only when exactly matching the built-in MOZI profile")
+  .option("--capable-context-retry", "consume the single Codex-orchestrated capable-context handoff", false)
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: {
+    workspace: string;
+    controlStateDir: string;
+    targetProfile?: string;
+    targetWorkspace?: string;
+    targetStateDir?: string;
+    capableContextRetry: boolean;
+    json: boolean;
+  }) => {
+    const emptyProbe = { ok: false, created: false, readBack: false, deleted: false };
+    const blocked = (reason: string) => ({
+      ok: false,
+      state: "CONTROL_BOOTSTRAP_BLOCKED",
+      nextAction: "CONTROL_BOOTSTRAP_BLOCKED",
+      capableContextAttempted: false,
+      stateDirectoryWriteProbe: emptyProbe,
+      reason,
+    });
+    const emit = (value: unknown) => {
+      if (opts.json) say(JSON.stringify(value));
+      else say(JSON.stringify(value, null, 2));
+    };
+    try {
+      const controlIdentityError = validateControlBootstrapControlIdentity({
+        controlWorkspaceRoot: opts.workspace,
+        controlStateDir: opts.controlStateDir,
+      });
+      if (controlIdentityError) {
+        emit(blocked(controlIdentityError));
+        return;
+      }
+      const hasLegacyWorkspace = opts.targetWorkspace !== undefined;
+      const hasLegacyStateDir = opts.targetStateDir !== undefined;
+      if (hasLegacyWorkspace !== hasLegacyStateDir || (opts.targetProfile && (hasLegacyWorkspace || hasLegacyStateDir))) {
+        emit(blocked("CONTROL_TARGET_PROFILE_REQUIRED"));
+        return;
+      }
+
+      let targetProfile;
+      try {
+        const profileId = selectControlTargetProfile(opts);
+        targetProfile = resolveControlTargetProfile(profileId, {
+          registryFile: controlTargetRegistryFile(),
+          controlWorkspaceRoot: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlWorkspaceRoot,
+          controlStateDir: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES.controlStateDir,
+        });
+      } catch (error) {
+        const code = error instanceof ControlTargetRegistryError || error instanceof ControlTargetSelectionError
+          ? error.code
+          : "CONTROL_TARGET_REGISTRY_INVALID";
+        emit(blocked(code));
+        return;
+      }
+      const isolationError = validateControlBootstrapIsolation({
+        controlWorkspaceRoot: opts.workspace,
+        controlStateDir: opts.controlStateDir,
+        targetProfile,
+      }, APPROVED_CONTROL_BOOTSTRAP_IDENTITIES, targetProfile);
+      if (isolationError) {
+        emit(blocked(isolationError));
+        return;
+      }
+      const controlRoot = resolveWorkspace(opts.workspace);
+      const expectedStateDir = path.resolve(opts.controlStateDir);
+      const actualStateDir = path.resolve(getStateDir());
+      const statePathsMatch = process.platform === "win32"
+        ? expectedStateDir.toLowerCase() === actualStateDir.toLowerCase()
+        : expectedStateDir === actualStateDir;
+      if (!statePathsMatch) {
+        emit(blocked("CONTROL_STATE_DIR_DOES_NOT_MATCH_C2C_STATE_DIR"));
+        return;
+      }
+
+      const workspace = new Workspace(controlRoot);
+      const result = await runControlBootstrap({
+        workspaceId: workspace.id,
+        controlWorkspaceRoot: workspace.root,
+        controlStateDir: expectedStateDir,
+        targetProfile,
+        capableContextRetry: opts.capableContextRetry,
+      }, createControlBootstrapCliAdapter(workspace.id, {
+        approvedIdentities: APPROVED_CONTROL_BOOTSTRAP_IDENTITIES,
+        approvedTargetProfile: targetProfile,
+        stateDirectoryWriteProbe: probeControlStateDirectoryWrite,
+        findBridge: (workspaceId) => findBridgeObservation(workspaceId),
+        startBridge: (workspaceRoot) => ensureBridge(workspaceRoot),
+        bridgeProbe: (runtime, workspaceId) => observeBridgeRecoveryProbe({
+          port: runtime.port,
+          adminToken: runtime.adminToken,
+          workspaceId,
+          timeoutMs: 12_000,
+        }),
+        reconcileLegacyRuntime: (identity) => reconcileLegacyControlRuntime(identity),
+      }));
+      emit(result);
+    } catch (error) {
+      emit(blocked(error instanceof Error ? error.message : "CONTROL_BOOTSTRAP_FAILED"));
+    }
+  });
+
+// ---------------------------------------------------------------- deterministic recovery helpers (internal)
+
+program
+  .command("recovery-probe", { hidden: true })
+  .description("Probe child-process capability locally and inside an existing Bridge")
+  .requiredOption("--target-profile <id>")
+  .option("--workspace <path>", "optional workspace identity assertion")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { targetProfile: string; workspace?: string; json: boolean }) => {
+    try {
+      const { workspace } = resolveRecoveryTarget(opts.targetProfile, opts.workspace);
+      const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspace.id));
+      const cloudflaredPath = profile?.cloudflaredPath;
+      const localProbe = await probeExecutionContext({ context: "local", cloudflaredPath });
+      const observation = await findBridgeObservation(workspace.id);
+      let bridgeProbe: Awaited<ReturnType<typeof probeExecutionContext>> | null = null;
+      let bridgeProbeError = false;
+      let bridgeInfoHealthy = false;
+      let bridgeInfoStatus: number | null = null;
+      let bridgeInfoErrorKind: string | null = null;
+      let bridgeInfoTunnelHealth: "HEALTHY" | "UNHEALTHY" | "UNKNOWN" = "UNKNOWN";
+      let bridgeProbeStatus: number | null = null;
+      let bridgeProbeErrorKind: string | null = null;
+      if (observation.state === "healthy") {
+        const bridgeObservation = await observeBridgeRecoveryProbe({
+          port: observation.runtime.port,
+          adminToken: observation.runtime.adminToken,
+          workspaceId: workspace.id,
+          timeoutMs: 12_000,
+        });
+        bridgeProbe = bridgeObservation.bridgeProbe;
+        bridgeProbeError = bridgeObservation.bridgeProbeErrorKind !== null;
+        bridgeInfoHealthy = bridgeObservation.bridgeInfoHealthy;
+        bridgeInfoStatus = bridgeObservation.bridgeInfoStatus;
+        bridgeInfoErrorKind = bridgeObservation.bridgeInfoErrorKind;
+        bridgeInfoTunnelHealth = bridgeObservation.bridgeInfoTunnelHealth ?? "UNKNOWN";
+        bridgeProbeStatus = bridgeObservation.bridgeProbeStatus;
+        bridgeProbeErrorKind = bridgeObservation.bridgeProbeErrorKind;
+      }
+      const payload = {
+        ok: true,
+        state: "RECOVERY_PROBE",
+        bridgeStatus: observation.state,
+        bridgeReason: observation.state === "unknown" ? observation.reason : undefined,
+        localProbe,
+        bridgeProbe,
+        bridgeProbeError,
+        bridgeInfoHealthy,
+        bridgeInfoStatus,
+        bridgeInfoErrorKind,
+        bridgeInfoTunnelHealth,
+        bridgeProbeStatus,
+        bridgeProbeErrorKind,
+        localRecoveryRuntimeSupportsProbe: true,
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else say(JSON.stringify(payload, null, 2));
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+program
+  .command("recovery-plan", { hidden: true })
+  .description("Return the next deterministic emergency-recovery state/action")
+  .requiredOption("--facts-base64 <value>")
+  .requiredOption("--target-profile <id>")
+  .option("--workspace <path>", "optional workspace identity assertion")
+  .option("--new-run", "start a new profile-bound recovery run", false)
+  .option("--authorize-restart", "consume the single restricted-Bridge restart attempt", false)
+  .option("--json", "machine-readable output", false)
+  .action((opts: { factsBase64: string; targetProfile: string; workspace?: string; newRun: boolean; authorizeRestart: boolean; json: boolean }) => {
+    try {
+      const facts = JSON.parse(Buffer.from(opts.factsBase64, "base64").toString("utf8")) as RecoveryFacts;
+      if (opts.newRun && facts.transitionEvent) throw new Error("--new-run cannot be combined with a recovery transition event");
+      let target: ReturnType<typeof resolveRecoveryTarget>;
+      try {
+        target = resolveRecoveryTarget(opts.targetProfile, opts.workspace);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "RECOVERY_TARGET_PROFILE_INVALID";
+        const blocked = { ok: false, state: "BLOCKED_STATE_INCONSISTENT", nextAction: "BLOCKED_STATE_INCONSISTENT", humanActionRequired: false, facts: { reason } };
+        if (opts.json) say(JSON.stringify(blocked)); else say(JSON.stringify(blocked, null, 2));
+        return;
+      }
+      const { workspace, binding } = target;
+      if (facts.workspace && facts.workspace.workspaceId !== binding.workspaceId) {
+        const blocked = { ok: false, state: "BLOCKED_STATE_INCONSISTENT", nextAction: "BLOCKED_STATE_INCONSISTENT", humanActionRequired: false, facts: { reason: "RECOVERY_TARGET_BINDING_MISMATCH" } };
+        if (opts.json) say(JSON.stringify(blocked)); else say(JSON.stringify(blocked, null, 2));
+        return;
+      }
+      const workspaceId = workspace.id;
+      let progress;
+      try {
+        progress = readRecoveryProgress(workspaceId);
+      } catch (error) {
+        const blocked = { ok: false, state: "BLOCKED_STATE_INCONSISTENT", nextAction: "BLOCKED_STATE_INCONSISTENT", humanActionRequired: false, facts: { reason: error instanceof Error ? error.message : "RECOVERY_TARGET_BINDING_INVALID" } };
+        if (opts.json) say(JSON.stringify(blocked)); else say(JSON.stringify(blocked, null, 2));
+        return;
+      }
+      if (progress && matchRecoveryTargetBinding(progress.targetBinding, binding) === "MISMATCH") {
+        const blocked = { ok: false, state: "BLOCKED_STATE_INCONSISTENT", nextAction: "BLOCKED_STATE_INCONSISTENT", humanActionRequired: false, facts: { reason: "RECOVERY_TARGET_BINDING_MISMATCH" } };
+        if (opts.json) say(JSON.stringify(blocked)); else say(JSON.stringify(blocked, null, 2));
+        return;
+      }
+      if (progress && !progress.targetBinding) progress = { ...progress, targetBinding: binding };
+      const refuseNewRun = opts.newRun && progress?.state === "BLOCKED_BRIDGE_UNKNOWN";
+      if (opts.newRun && !refuseNewRun) {
+        progress = { runId: createRecoveryRunId(), state: "LOCAL_DIAGNOSIS" as const, capableContextAttempted: false, bridgeRestartAttempted: false, legacyMigrationAuthorized: false, legacyMigrationAttempted: false, sessionSnapshot: facts.session ?? null, targetBinding: binding };
+        writeRecoveryProgress(workspaceId, progress);
+      }
+      if (progress) {
+        facts.recoverySessionSnapshot = progress.sessionSnapshot ?? null;
+        facts.legacyMigrationAuthorized = progress.legacyMigrationAuthorized === true;
+        facts.legacyMigrationAttempted = progress.legacyMigrationAttempted === true;
+      }
+
+      let result;
+      const terminalStates = new Set(["COMPLETE", "BLOCKED_LOCAL_EXECUTION", "BLOCKED_STATE_INCONSISTENT", "BLOCKED_BRIDGE_UNKNOWN", "LOCAL_RECOVERY_FAILED", "UNAPPROVED_CLOUDFLARED_PATH", "INVALID_RECOVERY_TRANSITION"]);
+      if (!opts.newRun && !facts.transitionEvent && progress?.state === "BLOCKED_BRIDGE_UNKNOWN") {
+        const resumed = resumeBlockedBridgeUnknownAsLegacy(progress, facts);
+        if (resumed) {
+          progress = resumed;
+          facts.recoveryState = resumed.state;
+          facts.recoverySessionSnapshot = resumed.sessionSnapshot ?? null;
+          facts.legacyMigrationAuthorized = resumed.legacyMigrationAuthorized === true;
+          facts.legacyMigrationAttempted = resumed.legacyMigrationAttempted === true;
+        }
+      }
+      if (refuseNewRun) {
+        result = {
+          ok: false,
+          state: "BLOCKED_BRIDGE_UNKNOWN" as const,
+          nextAction: "BLOCKED_BRIDGE_UNKNOWN" as const,
+          humanActionRequired: false,
+          facts: { reason: "a blocked recovery run must be explicitly re-evaluated in place; --new-run cannot replace its progress" },
+        };
+      } else if (!opts.newRun && facts.transitionEvent && progress && terminalStates.has(progress.state)) {
+        result = {
+          ok: false,
+          state: "INVALID_RECOVERY_TRANSITION" as const,
+          nextAction: "INVALID_RECOVERY_TRANSITION" as const,
+          humanActionRequired: false,
+          facts: { currentState: progress.state, event: facts.transitionEvent },
+        };
+      } else if (!opts.newRun && progress && terminalStates.has(progress.state)) {
+        result = {
+          ok: progress.state === "COMPLETE",
+          state: progress.state,
+          nextAction: progress.state,
+          humanActionRequired: false,
+          facts: { reason: "recovery run is already terminal; begin a new run explicitly to continue" },
+        };
+      } else if (!opts.newRun && !progress) {
+        result = {
+          ok: false,
+          state: facts.transitionEvent ? "INVALID_RECOVERY_TRANSITION" as const : "BLOCKED_STATE_INCONSISTENT" as const,
+          nextAction: facts.transitionEvent ? "INVALID_RECOVERY_TRANSITION" as const : "BLOCKED_STATE_INCONSISTENT" as const,
+          humanActionRequired: false,
+          facts: { reason: "no active recovery run state; begin with c2c-status.ps1 -StartNewRecovery" },
+        };
+      } else if (facts.transitionEvent && (!progress || facts.recoveryState !== progress.state)) {
+        result = {
+          ok: false,
+          state: "INVALID_RECOVERY_TRANSITION" as const,
+          nextAction: "INVALID_RECOVERY_TRANSITION" as const,
+          humanActionRequired: false,
+          facts: { currentState: progress?.state ?? null, suppliedState: facts.recoveryState ?? null, event: facts.transitionEvent },
+        };
+      } else {
+        if (progress) {
+          if (!facts.transitionEvent) facts.recoveryState = progress.state;
+          if (facts.transitionEvent === "CONNECTOR_CONFIRM_REQUESTED" || facts.transitionEvent === "CONNECTOR_CONFIRMED") {
+            if (!progress.pairedConnectorName || facts.actualConnectorName !== progress.pairedConnectorName) {
+              result = {
+                ok: false,
+                state: "INVALID_RECOVERY_TRANSITION" as const,
+                nextAction: "INVALID_RECOVERY_TRANSITION" as const,
+                humanActionRequired: false,
+                facts: { pairedConnectorName: progress.pairedConnectorName ?? null, actualConnectorName: facts.actualConnectorName ?? null },
+              };
+            }
+          }
+          facts.capableContextAttempted = progress.capableContextAttempted;
+          facts.bridgeRestartAttempted = progress.bridgeRestartAttempted;
+          if (facts.phase === "POST_RECOVERY_VERIFY") {
+            const currentConnectorName = facts.sessionAfter?.connectorName?.trim();
+            if (!progress.pairedConnectorName || currentConnectorName !== progress.pairedConnectorName.trim()) {
+              result = {
+                ok: false,
+                state: "BLOCKED_STATE_INCONSISTENT" as const,
+                nextAction: "BLOCKED_STATE_INCONSISTENT" as const,
+                humanActionRequired: false,
+                facts: { reason: "current Connector differs from the Connector confirmed during pairing", pairedConnectorName: progress.pairedConnectorName ?? null, currentConnectorName: currentConnectorName ?? null },
+              };
+            } else if (!progress.sessionSnapshot) {
+              result = {
+                ok: false,
+                state: "BLOCKED_STATE_INCONSISTENT" as const,
+                nextAction: "BLOCKED_STATE_INCONSISTENT" as const,
+                humanActionRequired: false,
+                facts: { reason: "recovery run has no protected session baseline" },
+              };
+            } else {
+              facts.session = progress.sessionSnapshot;
+              if (!facts.actualConnectorName) facts.actualConnectorName = facts.sessionAfter?.connectorName;
+            }
+          }
+        }
+        if (!result) result = planRecovery(facts);
+      }
+      if (opts.authorizeRestart && ["RESTART_BRIDGE_IN_CAPABLE_CONTEXT", "REPLACE_LEGACY_BRIDGE_ONCE"].includes(result.nextAction) && progress) {
+        progress = {
+          ...progress,
+          state: result.state,
+          bridgeRestartAttempted: true,
+          legacyMigrationAuthorized: result.nextAction === "REPLACE_LEGACY_BRIDGE_ONCE" || progress.legacyMigrationAuthorized === true,
+        };
+      }
+      if (!refuseNewRun && (opts.newRun || progress) && result.state !== "INVALID_RECOVERY_TRANSITION") {
+        writeRecoveryProgress(workspaceId, {
+          runId: progress?.runId ?? createRecoveryRunId(),
+          state: result.state,
+          capableContextAttempted: Boolean(progress?.capableContextAttempted || ("capableContextAttempted" in result.facts && result.facts.capableContextAttempted)),
+          bridgeRestartAttempted: Boolean(progress?.bridgeRestartAttempted),
+          legacyMigrationAuthorized: progress?.legacyMigrationAuthorized === true,
+          legacyMigrationAttempted: progress?.legacyMigrationAttempted === true,
+          legacyMigrationResumedFrom: progress?.legacyMigrationResumedFrom,
+          legacyMigrationEvidence: progress?.legacyMigrationEvidence,
+          sessionSnapshot: progress?.sessionSnapshot ?? facts.session ?? null,
+          pairedConnectorName: progress?.pairedConnectorName ?? (facts.transitionEvent === "PAIRING_COMPLETED" && result.state === "AI_CONFIRM_CONNECTOR" ? facts.actualConnectorName : undefined),
+          targetBinding: binding,
+        });
+      }
+      const reportedResult = { ...result, facts: { ...result.facts, targetBinding: binding } };
+      if (opts.json) say(JSON.stringify(reportedResult));
+      else say(JSON.stringify(reportedResult, null, 2));
+    } catch (error) {
+      if (error instanceof Error && error.message === "RECOVERY_TARGET_BINDING_INVALID") {
+        say(JSON.stringify({ ok: false, state: "BLOCKED_STATE_INCONSISTENT", reason: error.message }));
+        return;
+      }
+      handleCliError(error, opts.json);
+    }
+  });
+
+program
+  .command("recovery-replace-legacy-bridge", { hidden: true })
+  .description("Replace one explicitly authorized legacy Bridge without starting its Tunnel")
+  .requiredOption("--target-profile <id>")
+  .option("--workspace <path>", "optional workspace identity assertion")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { targetProfile: string; workspace?: string; json: boolean }) => {
+    let workspace: Workspace | null = null;
+    let progress = null as ReturnType<typeof readRecoveryProgress>;
+    try {
+      const target = resolveRecoveryTarget(opts.targetProfile, opts.workspace);
+      workspace = target.workspace;
+      progress = readRecoveryProgress(workspace.id);
+      if (progress && matchRecoveryTargetBinding(progress.targetBinding, target.binding) === "MISMATCH") {
+        say(JSON.stringify({ ok: false, state: "BLOCKED_STATE_INCONSISTENT", reason: "RECOVERY_TARGET_BINDING_MISMATCH" }));
+        return;
+      }
+      if (progress && !progress.targetBinding) {
+        progress = { ...progress, targetBinding: target.binding };
+        writeRecoveryProgress(workspace.id, progress);
+      }
+      if (!progress || progress.state !== "LEGACY_BRIDGE_PROBE_UNSUPPORTED" ||
+          !progress.bridgeRestartAttempted || progress.legacyMigrationAuthorized !== true || progress.legacyMigrationAttempted === true) {
+        say(JSON.stringify({ ok: false, state: "INVALID_RECOVERY_TRANSITION", reason: "legacy replacement was not selected and authorized exactly once by the recovery planner" }));
+        return;
+      }
+
+      const current = await findBridgeObservation(workspace.id);
+      if (current.state !== "healthy") {
+        progress.state = "BLOCKED_BRIDGE_UNKNOWN";
+        progress.legacyMigrationAuthorized = false;
+        writeRecoveryProgress(workspace.id, progress);
+        say(JSON.stringify({ ok: false, state: progress.state, reason: `Bridge is no longer healthy (${current.state})` }));
+        return;
+      }
+
+      const profile = readJsonIfExists<{ cloudflaredPath?: unknown }>(networkProfileFile(workspace.id));
+      const localProbe = await probeExecutionContext({ context: "local", cloudflaredPath: profile?.cloudflaredPath });
+      const probe = await observeBridgeRecoveryProbe({
+        port: current.runtime.port,
+        adminToken: current.runtime.adminToken,
+        workspaceId: workspace.id,
+        timeoutMs: 12_000,
+      });
+      const currentSession = readSession(workspace.id);
+      const facts: RecoveryFacts = {
+        workspace: { workspaceId: workspace.id, name: workspace.name },
+        session: currentSession ? snapshotRecoverySession(currentSession) : null,
+        recoverySessionSnapshot: progress.sessionSnapshot ?? null,
+        bridgeStatus: "healthy",
+        bridgeProbe: probe.bridgeProbe ?? undefined,
+        bridgeProbeError: probe.bridgeProbeErrorKind !== null,
+        bridgeInfoHealthy: probe.bridgeInfoHealthy,
+        bridgeInfoStatus: probe.bridgeInfoStatus,
+        bridgeInfoErrorKind: probe.bridgeInfoErrorKind,
+        bridgeInfoTunnelHealth: probe.bridgeInfoTunnelHealth,
+        bridgeProbeStatus: probe.bridgeProbeStatus,
+        bridgeProbeErrorKind: probe.bridgeProbeErrorKind,
+        localRecoveryRuntimeSupportsProbe: true,
+        localProbe,
+        bridgeRestartAttempted: progress.bridgeRestartAttempted,
+        legacyMigrationAuthorized: progress.legacyMigrationAuthorized,
+        legacyMigrationAttempted: progress.legacyMigrationAttempted,
+        doctor: { report: { tunnel: { ok: probe.bridgeInfoTunnelHealth === "HEALTHY" } } },
+      };
+      const eligibility = legacyMigrationEligibility(facts);
+      if (!eligibility.eligible) {
+        progress.state = eligibility.state;
+        progress.legacyMigrationAuthorized = false;
+        writeRecoveryProgress(workspace.id, progress);
+        say(JSON.stringify({ ok: false, state: progress.state, reason: eligibility.reason, bridgeProbe: probe, localProbe }));
+        return;
+      }
+
+      const migration = await replaceLegacyBridgeOnce(
+        facts,
+        { authorized: true, alreadyAttempted: false },
+        current.runtime.pid,
+        {
+          async consumeReplacementAttempt() {
+            const marker = consumeLegacyBridgeReplacementMarker(workspace!.id, progress!);
+            if (marker !== "CONSUMED") return marker;
+            progress!.legacyMigrationAttempted = true;
+            progress!.legacyMigrationAuthorized = false;
+            try {
+              writeRecoveryProgress(workspace!.id, progress!);
+            } catch {
+              return "PROGRESS_WRITE_FAILED";
+            }
+            return "CONSUMED";
+          },
+          async readSession() {
+            const saved = readSession(workspace!.id);
+            return saved ? snapshotRecoverySession(saved) : null;
+          },
+          async stopCurrentBridge() {
+            const stopped = await stopBridge(workspace!.root);
+            return stopped && await waitForProcessExit(current.runtime.pid);
+          },
+          async startCurrentBridge() {
+            const started = await ensureBridge(workspace!.root);
+            return { pid: started.runtime.pid };
+          },
+          async reprobeCurrentBridge() {
+            const observation = await findBridgeObservation(workspace!.id);
+            if (observation.state !== "healthy") {
+              return {
+                bridgeStatus: observation.state,
+                pid: observation.runtime?.pid,
+                observation: {
+                  bridgeInfoHealthy: false,
+                  bridgeInfoStatus: null,
+                  bridgeInfoErrorKind: "CONNECTION_FAILURE",
+                  bridgeProbe: null,
+                  bridgeProbeStatus: null,
+                  bridgeProbeErrorKind: "CONNECTION_FAILURE",
+                },
+              };
+            }
+            const reprobe = await observeBridgeRecoveryProbe({
+              port: observation.runtime.port,
+              adminToken: observation.runtime.adminToken,
+              workspaceId: workspace!.id,
+              timeoutMs: 12_000,
+            });
+            return { bridgeStatus: "healthy", pid: observation.runtime.pid, observation: reprobe };
+          },
+        }
+      );
+
+      progress.state = migration.state;
+      progress.legacyMigrationAuthorized = false;
+      writeRecoveryProgress(workspace.id, progress);
+      say(JSON.stringify({ ...migration, bridgeRestartAttempted: true, legacyMigrationAttempted: true }));
+    } catch (error) {
+      if (error instanceof Error && error.message === "RECOVERY_TARGET_BINDING_INVALID") {
+        say(JSON.stringify({ ok: false, state: "BLOCKED_STATE_INCONSISTENT", reason: error.message }));
+        return;
+      }
+      if (workspace && progress?.legacyMigrationAttempted === true) {
+        progress.state = "BLOCKED_LOCAL_EXECUTION";
+        progress.legacyMigrationAuthorized = false;
+        writeRecoveryProgress(workspace.id, progress);
+        say(JSON.stringify({ ok: false, state: progress.state, reason: error instanceof Error ? error.message : String(error), bridgeRestartAttempted: true, legacyMigrationAttempted: true }));
+        return;
+      }
+      handleCliError(error, opts.json);
+    }
   });
 
 // ---------------------------------------------------------------- pair / unpair
@@ -916,6 +1664,7 @@ session
       say(`模式：${conversation.mode === "project" ? "Project 合集" : "长对话"}`);
       if (conversation.projectUrl) say(`合集：${conversation.projectUrl}`);
       if (saved.title) say(`会话：${saved.title}`);
+      if (saved.workflowMode) say(`工作流：${saved.workflowMode}`);
       if (saved.url) say(`对话：${saved.url}`);
       if (saved.connectorName) say(`连接器：${saved.connectorName}`);
       if (saved.taskId) say(`任务：${saved.taskId}（第 ${saved.iteration ?? 0} 轮，${saved.lastState ?? "?"}）`);
@@ -964,6 +1713,7 @@ session
   .option("--iteration <n>")
   .option("--state <state>", "last protocol state, e.g. EXECUTED")
   .option("--mode <mode>", "long-chat or project")
+  .option("--workflow-mode <mode>", "quick or design-first")
   .option("--project-url <url>", "ChatGPT Project collection URL (…/g/g-p-…/project)")
   .option("--connector-name <name>", "exact connector title for this workspace")
   .option("--protocol-state <state>", "checkpoint protocol state, e.g. EXECUTED_SENT")
@@ -982,6 +1732,7 @@ session
       iteration?: string;
       state?: string;
       mode?: string;
+      workflowMode?: string;
       projectUrl?: string;
       connectorName?: string;
       protocolState?: string;
@@ -996,6 +1747,10 @@ session
       const modeRaw = opts.mode?.trim().toLowerCase();
       if (modeRaw && modeRaw !== "long-chat" && modeRaw !== "project") {
         throw new Error("mode must be long-chat or project");
+      }
+      const workflowRaw = opts.workflowMode?.trim().toLowerCase();
+      if (workflowRaw && workflowRaw !== "quick" && workflowRaw !== "design-first") {
+        throw new Error("workflow-mode must be quick or design-first");
       }
       const protocolRaw = opts.protocolState?.trim().toUpperCase();
       if (protocolRaw && !PROTOCOL_STATES.includes(protocolRaw as ProtocolState)) {
@@ -1017,6 +1772,7 @@ session
         iteration: opts.iteration ? parseInt(opts.iteration, 10) : undefined,
         lastState: opts.state,
         conversationMode: modeRaw as ConversationMode | undefined,
+        workflowMode: workflowRaw as "quick" | "design-first" | undefined,
         projectUrl: opts.projectUrl,
         connectorName: opts.connectorName,
         clearCheckpoint: opts.clearCheckpoint,
@@ -1050,6 +1806,56 @@ session
     if (!result.cleared) say("尚未记录 ChatGPT 会话。");
     else if (result.keptProject) check("已清除当前对话，合集绑定仍保留");
     else check("已清除会话记录，下次任务将新建 ChatGPT 会话");
+  });
+
+program
+  .command("artifact-sync")
+  .description("Safely materialize a declared Markdown Artifact Sync bundle")
+  .option("-w, --workspace <path>")
+  .requiredOption("--bundle-file <path>", "local UTF-8 file containing the Artifact Sync envelope")
+  .option("--json", "machine-readable receipt", false)
+  .action((opts: { workspace?: string; bundleFile: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const bundleText = fs.readFileSync(path.resolve(opts.bundleFile), "utf8");
+    const bundle = parseArtifactBundle(bundleText);
+    const saved: ReturnType<typeof materializeArtifact>[] = [];
+    let activeArtifact: (typeof bundle.artifacts)[number] | undefined;
+    try {
+      for (const artifact of bundle.artifacts) {
+        activeArtifact = artifact;
+        validateArtifactTargets(workspace.root, [artifact]);
+      }
+      for (const artifact of bundle.artifacts) {
+        activeArtifact = artifact;
+        saved.push(materializeArtifact(workspace.root, artifact));
+      }
+    } catch (error) {
+      const failure = {
+        bundleId: bundle.bundleId,
+        status: "FAILED",
+        saved,
+        failedArtifactId: activeArtifact?.id,
+        failedTargetPath: activeArtifact?.targetPath,
+        error: error instanceof Error ? error.message : String(error),
+        noImplementationPerformed: true,
+      };
+      if (opts.json) say(JSON.stringify(failure));
+      else say(`[ARTIFACT_SYNC_RECEIPT]\nBUNDLE_ID: ${bundle.bundleId}\nSTATUS: FAILED\nSAVED_COUNT: ${saved.length}\nFAILED_TARGET: ${activeArtifact?.targetPath ?? "bundle validation"}\nNO_IMPLEMENTATION_PERFORMED: true`);
+      process.exitCode = 1;
+      return;
+    }
+    const receipt = {
+      bundleId: bundle.bundleId,
+      afterSync: bundle.afterSync,
+      status: "SUCCESS",
+      saved,
+      receiptText: formatArtifactSyncReceipt(bundle.bundleId, saved),
+      noImplementationPerformed: true,
+    };
+    if (opts.json) say(JSON.stringify(receipt));
+    else {
+      say(formatArtifactSyncReceipt(bundle.bundleId, saved));
+    }
   });
 
 const prefsCmd = program
@@ -1246,6 +2052,7 @@ tunnelCmd
         workspaceName: workspace.name,
         zone,
         hostname: opts.hostname,
+        account: cloudflaredAccountForWorkspace(workspace.root),
       });
       if (await findLiveBridge(workspace.id)) await stopBridge(root);
       const payload = {
@@ -1267,16 +2074,15 @@ tunnelCmd
     }
   });
 
-acceptUnusedWorkspaceOption(
-  tunnelCmd
-    .command("login")
-    .description("Open the Cloudflare login window used by a named hostname")
-    .option("--json", "machine-readable output", false)
-)
-  .action(async (opts: { json: boolean }) => {
+tunnelCmd
+  .command("login")
+  .description("Open the Cloudflare login window used by a named hostname")
+  .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { json: boolean; workspace?: string }) => {
     try {
       if (!opts.json) say(NAMED_LOGIN_PROMPT);
-      const account = new ProcessCloudflaredAccount();
+      const account = cloudflaredAccountForWorkspace(resolveWorkspace(opts.workspace));
       await account.login();
       const payload = { ok: true, loggedIn: hasCloudflaredCert() };
       if (opts.json) say(JSON.stringify(payload));

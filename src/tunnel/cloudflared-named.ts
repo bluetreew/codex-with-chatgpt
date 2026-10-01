@@ -3,6 +3,7 @@ import readline from "node:readline";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { findBinary } from "./detect.js";
+import { resolveApprovedCloudflaredPath } from "../recovery/probe.js";
 import { tunnelProtocolArgs } from "./protocol.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
 
@@ -15,6 +16,8 @@ export interface CloudflaredNamedTunnelOptions {
   logger?: Logger;
   binaryOverride?: string;
   startTimeoutMs?: number;
+  /** When set, disable PATH/profile discovery and use only this approved root. */
+  managedCloudflaredDirectory?: string;
 }
 
 export function normalizeNamedTunnelHostname(hostname: string): string {
@@ -39,6 +42,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
   private readonly logger: Logger;
   private readonly binaryOverride?: string;
   private readonly startTimeoutMs: number;
+  private readonly managedCloudflaredDirectory?: string;
   private child: ChildProcess | null = null;
   private connected = false;
   private lastError: string | null = null;
@@ -53,9 +57,14 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
     this.logger = opts.logger ?? nullLogger;
     this.binaryOverride = opts.binaryOverride;
     this.startTimeoutMs = opts.startTimeoutMs ?? 45_000;
+    this.managedCloudflaredDirectory = opts.managedCloudflaredDirectory;
   }
 
   private binary(): string | null {
+    if (this.managedCloudflaredDirectory) {
+      const approved = resolveApprovedCloudflaredPath(undefined, this.managedCloudflaredDirectory);
+      return approved.status === "PASS" ? approved.path : null;
+    }
     return this.binaryOverride ?? findBinary("cloudflared");
   }
 

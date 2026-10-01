@@ -15,7 +15,8 @@
     "dev": "tsx src/cli/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "sync:skills": "node scripts/sync-skills.mjs"
   },
   "packageManager": "pnpm@11.24.0",
   "dependencies": {
@@ -23,6 +24,7 @@
     "commander": "^14.0.0",
     "express": "^5.1.0",
     "ignore": "^7.0.5",
+    "undici": "^8.10.2",
     "zod": "^3.25.0"
   },
   "devDependencies": {

@@ -14,6 +14,9 @@ export interface LastEndpoint {
   publicUrl: string | null;
   mcpUrl: string | null;
   connectorName?: string;
+  /** URL last configured in ChatGPT; remains unchanged until connector confirm. */
+  connectorConfirmedMcpUrl?: string | null;
+  connectorNeedsUpdate?: boolean;
   savedAt: string;
 }
 
@@ -29,6 +32,28 @@ export function writeLastEndpoint(endpoint: Omit<LastEndpoint, "savedAt">): Last
   const saved: LastEndpoint = { ...endpoint, savedAt: new Date().toISOString() };
   writeSecureJson(endpointFile(saved.workspaceId), saved);
   return saved;
+}
+
+export function confirmedConnectorUrl(endpoint: LastEndpoint | null): string | null {
+  if (!endpoint) return null;
+  return endpoint.connectorConfirmedMcpUrl === undefined
+    ? endpoint.mcpUrl : endpoint.connectorConfirmedMcpUrl;
+}
+
+export function confirmConnector(workspaceId: string, mcpUrl: string, connectorName?: string | null): LastEndpoint {
+  const previous = readLastEndpoint(workspaceId);
+  if (!previous?.mcpUrl || normalizePublicUrl(previous.mcpUrl) !== normalizePublicUrl(mcpUrl)) {
+    throw new Error("Connector URL does not match the current C2C endpoint");
+  }
+  return writeLastEndpoint({
+    workspaceId: previous.workspaceId,
+    port: previous.port,
+    publicUrl: previous.publicUrl,
+    mcpUrl: previous.mcpUrl,
+    connectorName: connectorName?.trim() || previous.connectorName,
+    connectorConfirmedMcpUrl: previous.mcpUrl,
+    connectorNeedsUpdate: false,
+  });
 }
 
 export function normalizePublicUrl(url: string): string {

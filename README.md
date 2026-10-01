@@ -46,10 +46,11 @@ Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](
 2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
-4. 安装 Skill：先确定 Codex home：如果设置了非空的 CODEX_HOME 就使用它，
-   否则使用 ~/.codex（Windows 默认为 %USERPROFILE%\.codex）。把仓库里的
-   skill/SKILL.md 复制到 <codex-home>/skills/codex-with-chatgpt/SKILL.md，
-   并把文件中 "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
+4. 运行 `corepack pnpm sync:skills`，安装并同步主 C2C Skill 和完整的
+   managed `c2c-emergency-recovery` package（`SKILL.md` 与 `scripts/**`）。
+   命令使用已设置的非空 `CODEX_HOME`，否则使用 `~/.codex`（Windows 默认为
+   `%USERPROFILE%\.codex`）；它会写入实际 checkout 路径，按 SHA256 校验
+   recovery package，并保留安装目录中非托管文件。
 5. 首次配置：按 SKILL.md 里的 first-time setup 流程执行
   （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
    全程只用内置浏览器，禁止打开任何第三方浏览器。
@@ -73,10 +74,12 @@ I am a non-technical user — do everything yourself:
 2. Download: clone https://github.com/XiaoDuoYa/codex-with-chatgpt into
    ~/codex-with-chatgpt (if it already exists, git pull to update).
 3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
-4. Install the Skill: determine the Codex home first: use a non-empty CODEX_HOME
-   when set, otherwise use ~/.codex (%USERPROFILE%\.codex on Windows). Copy
-   skill/SKILL.md to <codex-home>/skills/codex-with-chatgpt/SKILL.md, and update
-   the line "The codex-with-chatgpt checkout lives at:" to the actual clone path.
+4. Install and sync the main C2C skill and the complete managed
+   `c2c-emergency-recovery` package (`SKILL.md` and `scripts/**`) with
+   `corepack pnpm sync:skills`. It uses non-empty `CODEX_HOME` when set,
+   otherwise `~/.codex` (`%USERPROFILE%\.codex` on Windows), records the actual
+   checkout path, verifies recovery package files by SHA256, and preserves
+   unmanaged files in the installed directory.
 5. First-time setup: follow the SKILL.md "first-time setup" workflow
    (run c2c setup, configure the ChatGPT connector in the BUILT-IN browser,
    enter the pairing code). Never open a third-party browser.
@@ -100,16 +103,17 @@ anytime. / Skill 每天自动检查一次 GitHub，有新版本会自动更新�
 
 ## Install → Setup → Use (manual)
 
-Let `<codex-home>` be a non-empty `CODEX_HOME` when set; otherwise use `~/.codex`
-(`%USERPROFILE%\.codex` on Windows).
+`corepack pnpm sync:skills` uses non-empty `CODEX_HOME` when set; otherwise it
+uses `~/.codex` (`%USERPROFILE%\.codex` on Windows).
 
-1. Install the Codex Skill: copy `skill/` to `<codex-home>/skills/codex-with-chatgpt/`.
+1. Run `corepack pnpm sync:skills` to install the main Skill and the complete
+   managed `c2c-emergency-recovery` package (`SKILL.md` and `scripts/**`).
 2. Tell Codex: **"Set up Codex with ChatGPT."** (中文: "使用 Codex with ChatGPT 完成首次配置。")
 3. Use Codex normally: **"Use Codex with ChatGPT to implement XXX."**
 
 > **Installation scope:** This repository does not publish or install a Codex
 > Web GPT, launcher, or model-catalog entry. Installation consists of building
-> this checkout, installing `skill/SKILL.md` as a Codex Skill, and running
+> this checkout, syncing the main and managed recovery Skills, and running
 > `c2c setup` to configure the ChatGPT connector. For Web GPT or model-catalog
 > problems, see [troubleshooting](docs/troubleshooting.md).
 

@@ -1,13 +1,15 @@
 # Troubleshooting
 
-First move, always:
+First identify the failing layer. For Bridge/MCP/OAuth/Tunnel symptoms, run:
 
 ```
 c2c doctor
 ```
 
-It checks Node, workspace, bridge, MCP, OAuth and tunnel — and repairs what it
-can (restarts the bridge, restarts the tunnel) without asking.
+It checks Node, workspace, Bridge, MCP, OAuth and Tunnel, and may repair
+infrastructure when its own checks require it. A browser-control or Project
+chat-binding failure alone is not evidence to restart the Bridge or Tunnel;
+use the IAB cases below and preserve a healthy Connector.
 
 ## Common situations
 
@@ -127,6 +129,62 @@ there, so each new chat looks like a health-check failure.
 (`%USERPROFILE%\.codex` on Windows). After that, later chats do not need
 elevation.
 
+## Independent health layers
+
+Check these separately:
+
+- Connector → workspace (`workspace_info` identity)
+- IAB/browser page control
+- The current Codex thread's expected Chat URL, actual tab, and delivery
+
+`workspace_info PASS` validates only Connector → workspace. It does not prove
+IAB control, current-thread binding, or message delivery.
+
+### Official Browser Runtime cannot control the IAB
+
+Use the official OpenAI Browser Runtime as the C2C browser-health authority.
+Bootstrap the active bundled browser-client.mjs through node_repl with
+setupBrowserRuntime({globals: globalThis}), then obtain the existing IAB with
+agent.browsers.get("iab"). A previous CUA metadata result or CUA timeout does
+not establish Browser Runtime health and is never a Bridge failure.
+
+If bundled-client discovery or page control fails, report
+IAB_CONTROL_UNAVAILABLE with the exact failure. Keep healthy Connector,
+endpoint, Bridge, and Tunnel state unchanged. Do not install or use an
+unofficial browser bridge. Re-bootstrap after a kernel
+reset and reacquire the existing exact-URL tab before deciding it is lost.
+
+### Fresh Codex session has an empty IAB tab list
+
+An official Browser Runtime bootstrap can succeed and provide an IAB whose tab list is empty in a new Codex session. This is a new session-scoped browser context; it does not prove browser failure or that the existing ChatGPT conversation disappeared.
+
+Resolve an authoritative expectedChatUrl first. Long-chat may use session.url. Project mode needs an explicit URL for this Codex conversation or one previously verified in this conversation; workspace-level session.url alone is insufficient. Without a proven Project thread URL, stop with THREAD_BINDING_UNKNOWN.
+
+When the current IAB has no tabs and expectedChatUrl is authoritative, create exactly one tab, navigate it to expectedChatUrl, verify the actual URL, and confirm the composer is present and enabled. A new browser tab reopens the existing conversation; it does not create a ChatGPT conversation.
+
+After a same-session Node REPL reset, reacquire the existing IAB and tab instead; do not call tabs.new().
+
+### Send timed out after Enter
+
+Treat the send result as unknown, not failed. Re-bootstrap the official
+browser-client, reacquire the same IAB and the tab whose actual URL equals
+`expectedChatUrl`, then inspect the same conversation for the exact outbound
+text or unique marker. If present, it is committed: do not resend. Only when
+the conversation is fully loaded and the exact item is definitely absent may
+one controlled retry be considered. If presence is uncertain, stop without
+retrying. For INIT/EXECUTED/HANDOFF/REVIEW/DONE/probe, check the unique
+`TASK_ID` + `STATE` + `ITERATION` marker before a send.
+
+### Project mode shows a different chat than `session.url`
+
+Project mode stores `session.url`, task ID and checkpoint at workspace scope.
+They are last-saved pointers, not proof of the current Codex thread's binding.
+Use only a URL explicitly supplied for this thread or verified in this
+Codex conversation. If none is known, open a chat from the expected
+`conversation.projectUrl`; do not silently navigate to or overwrite
+`session.url`. If ownership remains unclear, stop with
+`THREAD_BINDING_UNKNOWN`.
+
 ### Port already in use
 Handled automatically: an existing healthy bridge for the same workspace is
 reused; anything else makes the bridge pick a free port. Configuration follows
@@ -162,10 +220,15 @@ matches this workspace and tell Codex「已找到」, or say you want the old
 long-chat instead. Each workspace has its own Project and its own connector.
 
 ### Completely stuck
+
+Use a full stop/setup cycle only when C2C infrastructure checks prove the
+Bridge or Tunnel itself cannot be recovered. It recreates the Bridge, Tunnel,
+and pairing session from scratch. A healthy infrastructure with an IAB-only
+or thread-binding failure does not qualify; follow the browser and Project
+cases above. Existing authorizations stay valid unless you also ran
+`c2c unpair`.
+
 ```
 c2c stop
 c2c setup
 ```
-
-re-creates the bridge, tunnel and pairing session from scratch. Existing
-authorizations stay valid unless you also ran `c2c unpair`.
