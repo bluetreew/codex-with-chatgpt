@@ -16,9 +16,14 @@ param(
     [string]$SavedChatUrlAfter = "",
     [string]$CheckId = "",
     [string]$ReplyCheckId = "",
+    [switch]$ReadOnly,
     [switch]$StartNewRecovery,
     [switch]$AuthorizeRestart
 )
+
+if ($ReadOnly -and ($StartNewRecovery -or $AuthorizeRestart -or $TransitionEvent)) {
+    throw '-ReadOnly cannot be combined with recovery mutations.'
+}
 
 . "$PSScriptRoot\_common.ps1" -TargetProfile $TargetProfile -WorkspacePath $WorkspacePath -StateDir $StateDir -C2cJs $C2cJs
 
@@ -66,6 +71,7 @@ for ($stepIndex = 0; $stepIndex -lt 3; $stepIndex++) {
     $planArgs = @('recovery-plan', '--target-profile', $TargetProfile, '--workspace', $WorkspacePath, '--facts-base64', $factsBase64, '--json')
     if ($StartNewRecovery -and $stepIndex -eq 0) { $planArgs += '--new-run' }
     if ($AuthorizeRestart -and $stepIndex -eq 0) { $planArgs += '--authorize-restart' }
+    if ($ReadOnly) { $planArgs += '--read-only' }
     $plan = Invoke-C2CJson -C2CArgs $planArgs
     $steps += $plan
     if ($plan.nextAction -ne 'COMPARE_ENDPOINT') { break }

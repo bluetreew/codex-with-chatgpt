@@ -67,11 +67,12 @@ whatever data it needs by itself.
    - **long-chat** (legacy session file, or the user opted out): ONE ChatGPT
      conversation per workspace. Never silently start a new chat.
    - **project** (new workspaces, or an existing workspace that opted in):
-     ONE ChatGPT Project (collection) per workspace. Same Codex conversation
-     reuses the ChatGPT chat URL saved in THIS thread. A new Codex
+     ONE ChatGPT Project (collection) per workspace, with a separate chat
+     for each Codex conversation. A thread reuses only a Chat URL verified
+     for THIS Codex conversation. The workspace-level `session.url` is not
+     evidence that a Project chat belongs to this thread. A new Codex
      conversation opens a new chat from the Project collection page — never
-     `goto` `https://chatgpt.com/` to create it, and never reuse another
-     Codex conversation's chat URL just because `session.url` exists.
+     `goto` `https://chatgpt.com/` to create it or inherit another thread's chat.
    Each workspace also has exactly ONE ChatGPT connector. Do not create a
    second connector for the same workspace. Other workspaces may have their
    own connectors — never edit those.
@@ -103,22 +104,36 @@ whatever data it needs by itself.
 
 ## In-app browser (ChatGPT)
 
-### Browser bootstrap compatibility
+### Official Browser Runtime (primary)
 
-For a coding or analysis task, never display a `[C2C]` INIT/EXECUTED message
-and ask the user to relay it, and never ask the user to paste a ChatGPT
-PLAN/DONE reply back into Codex. That is not a supported fallback. Confirm that
-the control message is visible in the ChatGPT tab before writing a
-`waitingFor: GPT_*` checkpoint.
+C2C's primary ChatGPT control surface is the official OpenAI Browser Runtime.
+The bundled browser-client.mjs is its standard bootstrap mechanism.
+Computer Use / CUA is not required by C2C and is not a recovery control path.
 
-On some Codex desktop sessions, a fresh `node_repl` does not expose
-`setupBrowserRuntime` or `agent` as globals. That alone is not a failure.
-Before controlling ChatGPT, discover the active bundled Browser plugin and
-import its own `scripts/browser-client.mjs`; do not hardcode a plugin version.
-Call the module's `setupBrowserRuntime({ globals: globalThis })`, retain its
-returned agent, and then require `agent.browsers.list()` to expose an `iab`
-backend. An official bootstrap failure or a missing `iab` backend is the
-failure condition. Do not use CUA/Computer Use as a fallback.
+For every ChatGPT page operation, ensure one verified Browser Runtime agent and
+its IAB browser:
+
+1. Reuse an already verified runtime and iab handle in this Codex session.
+2. Otherwise discover the active official bundled Browser plugin under
+   .codex/plugins/cache/openai-bundled/. Resolve exactly one
+   scripts/browser-client.mjs; if none or multiple candidates remain,
+   fail closed with IAB_CONTROL_UNAVAILABLE and the discovery details.
+   Never hardcode a plugin version or install/replace the browser service.
+3. Import that module through node_repl, call
+   setupBrowserRuntime({globals: globalThis}), and retain the returned agent.
+4. Require agent.browsers.list() to expose type == "iab", then obtain it
+   with agent.browsers.get("iab"). If metadata.codexSessionId is
+   available, verify it matches the current Codex session before control.
+5. Use the official Browser Runtime as the authority for browser health.
+   A Browser Runtime control failure is IAB_CONTROL_UNAVAILABLE; it is not
+   evidence of Bridge, MCP, Connector, or Tunnel failure and never authorizes
+   changes to those healthy layers.
+
+If the Node REPL resets or a handle becomes stale, re-bootstrap the same
+official client, reacquire the existing IAB, list its tabs, and bind the
+existing tab whose actual URL equals expectedChatUrl. A reset does not prove
+that the IAB or tab was lost. Reuse the existing tab; do not create another
+ChatGPT tab or conversation.
 
 Official skill: `control-in-app-browser`. These C2C rules override defaults
 that close the tab, hide the window, or stall on the settings page.
@@ -129,10 +144,21 @@ that close the tab, hide the window, or stall on the settings page.
    re-read `documentation()` if it is already bound. Never `getDefault()`,
    `getForUrl()`, or Computer Use.
 
-2. **One tab.** Create the ChatGPT tab once (`tabs.new()`). After that, only
-   `tab.goto(...)` to switch URLs. If the tab still exists, claim it — never
-   open a second ChatGPT tab. Do not `goto` the URL you are already on.
+2. **Tab lifecycle is per Codex session.** A Codex session uses one IAB and one reusable ChatGPT tab. Reuse an existing exact-URL tab before navigating; never create another tab when a suitable tab exists.
 
+   **Same-session handle reset:** A Node REPL reset or stale handle invalidates JavaScript handles, not the Codex session, IAB, or tab. Re-bootstrap the same official client, get the same IAB, list tabs, and bind the existing tab whose actual URL equals expectedChatUrl with `tabs.get(id)`. This path MUST NOT call `tabs.new()`.
+
+   **Fresh Codex session:** A newly started Codex session may receive a new IAB whose tabs.list() is empty. An empty tab list while the IAB exists means Browser Runtime health is PASS and TAB_INITIALIZATION_REQUIRED; it is not IAB_CONTROL_UNAVAILABLE or TARGET_TAB_DISCOVERY failure by itself.
+
+   Resolve expectedChatUrl before navigating. In long-chat, session.url is authoritative. In Project mode, only an explicit URL for THIS Codex conversation or a URL previously verified for THIS conversation is authoritative; workspace-level session.url alone is insufficient. If Project mode has no authoritative thread URL, stop with THREAD_BINDING_UNKNOWN and do not call goto.
+
+   Choose the tab in this order:
+   - If a tab already has the exact expected URL, bind it with `tabs.get(id)`.
+   - If there is no exact match but exactly one reusable ChatGPT tab exists, bind it with `tabs.get(id)`, reuse it, and navigate that tab to expectedChatUrl.
+   - If the current session is fresh and the IAB tab list is empty, create exactly one tab with tab = await iab.tabs.new(), then await tab.goto(expectedChatUrl).
+   - If several non-matching tabs make the target ambiguous, stop and resolve the tab selection; do not create another tab.
+
+   After navigation, require await tab.url() == expectedChatUrl and verify the Chat composer is present and enabled before sending. tabs.new() creates a browser tab for this Codex session; it does not create a ChatGPT conversation. Navigating to an existing expectedChatUrl reopens that existing conversation. Creating a ChatGPT conversation requires using the Project collection New chat composer. Report a tab-control failure only if tabs.new(), navigation, actual-URL verification, or composer observation fails; preserve the exact failed stage.
 3. **Foreground + keep (standby).** Right after opening or claiming the tab:
    - `await (await iab.capabilities.get("visibility")).set(true)` — first-time
      setup and ChatGPT chatting stay in front of the user so they can watch.
@@ -148,8 +174,9 @@ that close the tab, hide the window, or stall on the settings page.
    - 插件总管: `https://chatgpt.com/plugins`
    - 加插件: `https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins`
    - 新对话 (long-chat only, and only if no saved chat): `https://chatgpt.com/`
-   - Saved C2C chat: `conversation.chatUrl` / `session.url` (long-chat, or
-     the chat already bound in THIS Codex conversation)
+   - Saved C2C chat: long-chat uses `conversation.chatUrl` / `session.url`.
+     Project mode uses only a URL verified for THIS Codex conversation;
+     `session.url` alone is never the current thread's target.
    - Saved Project collection: `conversation.projectUrl`
      (`https://chatgpt.com/g/g-p-…/project`)
    Never click Reconnect / Refresh on an existing connector. The old address is
@@ -197,6 +224,45 @@ that close the tab, hide the window, or stall on the settings page.
    A browser/js timeout is not failure. Claim the same tab, read the page, keep
    standby. If ChatGPT is still thinking, keep polling. Never open a second
    tab and never resend INIT/EXECUTED just because a wait timed out.
+
+### Send gate, timeout recovery, and health layers
+
+Before sending any message to ChatGPT, require all three checks:
+
+1. `expectedChatUrl` comes from an explicit URL supplied for this Codex
+   conversation or from a URL previously verified in THIS conversation.
+   In long-chat, `session.url` may supply it. In project mode, the
+   workspace-level `session.url` is never sufficient.
+2. Obtain control of the target with the official `iab` browser-client and
+   require `actualTabUrl == expectedChatUrl`. A `listTabs()` entry or URL
+   metadata is not a controlled page.
+3. Confirm the Chat composer is present and enabled.
+
+If any check fails, do not send. For a project-mode URL with no proven
+thread owner, report `THREAD_BINDING_UNKNOWN`. Connector health, a Project
+name, a tab title, `listTabs()` metadata, and `workspace_info PASS` cannot
+replace the exact URL or composer checks.
+
+A timeout or kernel reset after pressing Send/Enter makes the side effect
+unknown, not failed. Re-bootstrap the official browser-client, reacquire the
+same `iab`, list tabs, and bind the existing tab whose actual URL equals
+`expectedChatUrl`. Inspect that conversation for the exact outbound message
+or marker. If it is present, treat the send as committed and do not resend.
+Only if the target conversation is loaded and the exact message is definitely
+absent may one controlled retry be considered; if the outcome is ambiguous,
+stop without retrying. Before INIT, EXECUTED, HANDOFF, REVIEW, DONE, or a
+probe, check for its unique `TASK_ID` + `STATE` + `ITERATION` or
+user-specified marker; an existing marker means do not duplicate it.
+
+Report these health layers separately:
+
+- Connector → workspace (`workspace_info` identity)
+- IAB/browser page control
+- This Codex thread's Chat binding, send state, and delivery
+
+`workspace_info PASS` proves only Connector → workspace. It does not prove
+that IAB is controllable, the correct thread's chat is open, or a message
+was delivered.
 
 ## Locations
 
@@ -271,9 +337,9 @@ Inside the checkout directory (see Locations):
 
 1. `git pull --ff-only` (if it fails due to local edits: `git stash && git pull --ff-only`).
 2. `corepack pnpm install && corepack pnpm build`.
-3. Re-install the Skill: copy `skill/SKILL.md` to
-   `~/.codex/skills/codex-with-chatgpt/SKILL.md`, then fix the "checkout lives at:"
-   line in the copy to the actual checkout path.
+3. Re-install both C2C skills by running `corepack pnpm sync:skills`. This
+   updates the main skill and `c2c-emergency-recovery` together, and records
+   the actual checkout path in the installed main skill.
 4. `c2c sandbox-allow --json` (so existing installs pick up the sandbox allowlist),
    then `c2c restart -w <workspace>` so the bridge runs the new code, then
    `c2c update-check --force --json` to refresh the cache (should now report up to date).
@@ -441,13 +507,37 @@ saved URL binding.
 
 **Identity and rename rule**
 
-- The saved ChatGPT chat URL is the sole conversation identity.
+- A message target is the exact URL of the controlled Chat tab. In long-chat,
+  `session.url` is authoritative. In project mode, it is only a workspace
+  pointer and does not prove the current thread's binding. A controlled IAB
+  URL identifies this thread only when available browser metadata
+  `codexSessionId` matches this Codex session; a tab listing alone is not proof.
 - Never search, recover, bind, or verify a chat by its title.
 - A rename is optional UX. If a direct rename control is available in the
   current Chat page, use the user's title or a short goal-based title. Do not
   hunt menus. After rename, read the address bar and require it to equal the
-  saved URL. If it differs, stop rename handling and keep the original mapping;
-  never recover by title. A rename failure does not fail setup.
+  expected URL for this conversation. If it differs, stop rename handling
+  and keep the original mapping; never recover by title. A rename failure
+  does not fail setup.
+
+### Project-mode workspace pointers and task state
+
+The current session store is workspace-scoped. In `project` mode,
+`session.url` is only the workspace's last-saved chat pointer or a legacy
+hint; it is not an authoritative binding for the current Codex thread.
+`taskId`, `iteration`, `lastState`, and `checkpoint` are also workspace-level
+state unless a thread-local store is explicitly implemented. They may belong
+to a different Codex conversation.
+
+For this thread, use an explicit user-provided Chat URL or a URL previously
+verified in this Codex conversation, then pass the send gate above. If a
+new Codex conversation has no such URL, open a new chat from
+`conversation.projectUrl`; do not navigate to `session.url` just because it
+exists. Resume a workspace checkpoint only when its task ID and expected
+Chat URL match this conversation's own C2C history. Otherwise stop with
+`THREAD_BINDING_UNKNOWN` instead of resuming or overwriting the workspace
+pointer. If this thread's actual URL differs from `session.url`, do not
+assume either is wrong and do not overwrite `session.url` to make them match.
 
 ### long-chat (do not rewrite this path)
 
@@ -478,25 +568,31 @@ ONE ChatGPT conversation per workspace. Same as before.
 
 ### project (new workspaces)
 
-One ChatGPT Project per workspace. Mapping:
+One ChatGPT Project per workspace, with chats scoped to Codex conversations:
 
-1. Same Codex conversation (this thread still has context) → same ChatGPT
-   chat URL. `goto` that URL directly. Do not open the collection first.
-2. Same workspace, a **new** Codex conversation → new ChatGPT chat from the
-   collection page (`conversation.projectUrl`). Ignore `session.url` unless
-   you already saved it earlier in THIS Codex thread.
+1. Continue the same Codex conversation only with its explicit or previously
+   verified URL, then re-check the actual tab through the send gate.
+2. A **new** Codex conversation opens a new ChatGPT chat from
+   `conversation.projectUrl`. The workspace-level `session.url` is only a
+   candidate hint and never proves that chat belongs to the new thread.
 3. Different workspace → different Project and different connector.
 
 **Open a chat in this Codex thread**
 
-- If you already saved a ChatGPT chat URL earlier in THIS Codex conversation:
-  `goto` that URL. Continue. No new chat. No HANDOFF.
+- If this turn supplies an explicit Chat URL for THIS Codex conversation,
+  use it as `expectedChatUrl` and verify the controlled tab through the send
+  gate. Else if this conversation records a URL previously verified for this
+  thread, reuse it and re-check `actualTabUrl`. Neither case is satisfied by
+  workspace-level `session.url` alone. No new chat and no HANDOFF.
 - Else if `conversation.projectReady`: `goto` `conversation.projectUrl`.
   On that page, use the on-page composer (「{项目名}中的新聊天」 / "New chat
   in …"). Do not use the sidebar and do not `goto` `https://chatgpt.com/`.
   Confirm Chat mode (**In-app browser** §7). Boot prompt, then workspace_info
-  with the **exact** `connectorName`. After the reply names this workspace,
-  `c2c session set -w <ws> --mode project --project-url <collection> --url <chat> --connector-name "<connectorName>" --title "C2C <workspace name>"`.
+  with the **exact** `connectorName`. After the reply names this workspace, save
+  `expectedChatUrl` with `c2c session set -w <ws> --mode project
+  --project-url <collection> --url <chat> --connector-name
+  "<connectorName>" --title "C2C <workspace name>"`. This records the
+  workspace-level last-saved pointer; it does not bind other Codex threads.
   If this Codex thread is continuing a previous C2C task, send HANDOFF right
   after the boot prompt.
 - Else: **Bind Project** first.
@@ -617,16 +713,20 @@ The check verifies the existing route and does not repair it.
 
    Require the local doctor checks for state/sandbox, workspace, Bridge, MCP,
    OAuth, and Tunnel to pass; require `chatgptRepair.needed` and
-   `namedRepair.needed` to be false. Require the session to contain its saved
-   Chat URL and exact Connector name. The workspace result supplies the local
-   `name` and `workspaceId` for comparison with `workspace_info`.
+   `namedRepair.needed` to be false. Require the exact Connector name. In
+   long-chat, use the saved `session.url` as `expectedChatUrl`; in project mode,
+   use only the explicit or previously verified URL for THIS Codex conversation.
+   If project mode has no proven thread URL, stop with `THREAD_BINDING_UNKNOWN`;
+   do not use the workspace pointer. The workspace result supplies local `name`
+   and `workspaceId` for comparison with `workspace_info`.
 2. If any local requirement fails, stop before opening ChatGPT and report
    `C2C CHECK: RECOVERY_REQUIRED`, the failed layer and reason, and the next
    recovery action. Do not run repair or maintenance commands.
 3. Bootstrap/reuse the built-in IAB as described in **In-app browser
-   (ChatGPT)**. Open only the saved session Chat URL; reuse its tab when already
-   there. Do not search by title, create a Chat, or change its title. Require
-   `currentChatUrl == savedChatUrl` before sending anything.
+   (ChatGPT)**. Open only `expectedChatUrl`; reuse the existing exact-URL tab.
+   Do not search by title, create a Chat, or change its title. Require the
+   controlled `actualTabUrl == expectedChatUrl` and an enabled composer before
+   sending. `listTabs()` metadata alone does not pass this gate.
 4. Generate a short unique CHECK_ID and send this ordinary message to that
    Chat, replacing the placeholders with the captured values:
 
@@ -650,18 +750,18 @@ The check verifies the existing route and does not repair it.
    still be generating. Require the CHECK_ID, workspace name, and workspace ID
    to match the local results. A mismatch is `C2C CHECK: FAIL`, layer
    `WORKSPACE_IDENTITY`; stop and report the binding error.
-6. Read `c2c session --json` again. Require these values to be unchanged:
-   `taskId`, `iteration`, `lastState`, `checkpoint` (including protocol state
-   and waiting target), `workflowMode`, Project URL, saved Chat URL, and
-   Connector name. A changed value is `C2C CHECK: FAIL`, layer
-   `SESSION_INTEGRITY`.
+6. Read `c2c session --json` again. Require `taskId`, `iteration`, `lastState`,
+   `checkpoint`, `workflowMode`, Project URL, workspace-level `session.url`,
+   and Connector name to be unchanged. In project mode, `session.url` is
+   checked only for workspace-state integrity, never as thread identity.
+   A changed value is `C2C CHECK: FAIL`, layer `SESSION_INTEGRITY`.
 7. On success, report:
 
    ```text
    C2C CHECK: PASS
    ✓ Local bridge
    ✓ Secure connection
-   ✓ Saved Chat binding
+   ✓ Thread Chat binding and delivery
    ✓ ChatGPT Connector and workspace identity
    ✓ Codex → ChatGPT → Codex round trip
    Workspace: <workspaceName>
@@ -782,10 +882,14 @@ ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/proto
    already provides. After sending a control message, wait per
    **In-app browser** §8.
 
-   **Resume from `session.checkpoint` before any INIT.** Missing checkpoint
-   (legacy session): continue as a normal new/continued loop. A browser/js
-   timeout is not a lost task — claim the original tab; do not INIT, re-run,
-   or resend EXECUTED just because a wait timed out.
+   **Resume only from a checkpoint proven to belong to this Codex thread.**
+   In long-chat, `session.checkpoint` follows the workspace's single chat.
+   In project mode, `taskId`, `iteration`, and `session.checkpoint` are
+   workspace-level hints; resume only if the task ID and expectedChatUrl match
+   this conversation's own C2C history. Otherwise stop with
+   `THREAD_BINDING_UNKNOWN` and establish this thread's Project chat. A
+   browser/js timeout is not a lost task: reacquire the same tab and inspect
+   the target conversation; do not INIT, re-run, or resend because of timeout.
    - `EXECUTED_SENT` + `waitingFor=GPT_REVIEW`: do not INIT, do not re-run,
      do not resend EXECUTED. Stay on the saved chat and wait for review. If
      that chat 404s: HANDOFF from checkpoint fields (no logs), then wait.
@@ -929,9 +1033,11 @@ the previous public address is gone. Doctor already started a new one.
 4. After Connected / pairing, run `c2c connector-confirm -w <workspace>
    --mcp-url <chatgptRepair.mcpUrl> --json`, then `c2c doctor --json` again.
    Same tab: only after the Doctor gate is green,
-   reopen the chat this Codex thread was already using (`session.url` /
-   the URL you saved earlier in THIS thread). Do not rewrite Project
-   instructions — they store the connector **name**, which did not change.
+   reopen the chat URL already verified for THIS Codex thread. Long-chat may
+   use `session.url`; project mode must use an explicit or previously verified
+   thread URL, never the workspace pointer alone. If no project thread URL
+   is proven, stop with `THREAD_BINDING_UNKNOWN` and use the Project workflow.
+   Do not rewrite Project instructions — they store the connector **name**.
    In that same chat, send the workspace_info check from setup step 6
    (exact `connectorName`). Doctor green is not enough: the old conversation
    may still be bound to the deleted connector.

@@ -30,9 +30,9 @@ Agent（Codex），然后去倒杯咖啡：
 2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
-4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中
-   "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
+4. 运行 `corepack pnpm sync:skills`，安装并同步主 C2C Skill 和完整的
+   managed `c2c-emergency-recovery` package（`SKILL.md` 与 `scripts/**`）。
+   命令会按 SHA256 校验 recovery package，并保留安装目录中非托管文件。
 5. 首次配置：按 SKILL.md 里的 first-time setup 流程执行
   （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
    全程只用内置浏览器，禁止打开任何第三方浏览器。
@@ -47,7 +47,8 @@ Agent（Codex），然后去倒杯咖啡：
 
 ## 安装 → 配置 → 使用（手动版）
 
-1. 安装 Codex Skill：把 `skill/` 复制到 `~/.codex/skills/codex-with-chatgpt/`。
+1. 运行 `corepack pnpm sync:skills`，安装并同步主 C2C Skill 和完整的
+   managed `c2c-emergency-recovery` package（`SKILL.md` 与 `scripts/**`）。
 2. 对 Codex 说：**"使用 Codex with ChatGPT 完成首次配置。"**
 3. 之后正常使用：**"使用 Codex with ChatGPT，帮我实现 XXX。"**
 

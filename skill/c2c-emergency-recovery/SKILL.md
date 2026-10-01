@@ -101,7 +101,36 @@ START → LOCAL_DIAGNOSIS
 
 The structured helper may instead return `BLOCKED_LOCAL_EXECUTION`,
 `BLOCKED_BRIDGE_UNKNOWN`, `BLOCKED_STATE_INCONSISTENT`, or
-`LOCAL_RECOVERY_FAILED`. Surface that state and stop.
+`LOCAL_RECOVERY_FAILED`. Surface that state and stop. Browser control failures
+are reported separately as `IAB_CONTROL_UNAVAILABLE`; never map a CUA or IAB
+control timeout to `BLOCKED_BRIDGE_UNKNOWN`.
+
+## Browser control contract
+
+All ChatGPT page control in this recovery uses the official OpenAI Browser
+Runtime. Its standard bootstrap is the active bundled Browser plugin's
+scripts/browser-client.mjs, imported through node_repl:
+
+1. Reuse a verified Browser Runtime agent and IAB handle when they are already
+   available in this Codex session.
+2. Otherwise discover exactly one active client under
+   .codex/plugins/cache/openai-bundled/; fail closed with
+   IAB_CONTROL_UNAVAILABLE if it is missing or ambiguous.
+3. Import browser-client.mjs, call
+   setupBrowserRuntime({globals: globalThis}), and retain the returned agent.
+4. Require an IAB entry from agent.browsers.list(), then call
+   agent.browsers.get("iab"). Match metadata.codexSessionId to the
+   current Codex session when the field is supplied.
+5. Use that Browser Runtime as the C2C browser-health authority. Do not use
+   cua.getState(), cua.listBrowsers(), cua.listTabs(), cua.getTab(),
+   or cua.createBrowserTab() as the recovery control path. A CUA timeout is
+   not a Bridge finding and cannot produce BLOCKED_BRIDGE_UNKNOWN.
+
+Only Bridge/MCP/Tunnel checks can produce their corresponding infrastructure
+failure states. A failed Browser Runtime control attempt reports
+IAB_CONTROL_UNAVAILABLE with its exact initialization or page-control error;
+it does not authorize changes to a healthy Connector, endpoint, Bridge, or
+Tunnel.
 
 ## Procedure
 
@@ -116,6 +145,10 @@ The structured helper may instead return `BLOCKED_LOCAL_EXECUTION`,
    evidence; never replace it with a new run. The stored binding includes
    profile id, workspace id, canonical workspace root, and state directory.
    The C2C session schema remains unchanged.
+   For diagnosis that must preserve recovery progress, pass `-ReadOnly` to
+   `c2c-status.ps1`. This evaluates the current plan without writing progress;
+   it cannot be combined with `-StartNewRecovery`, `-AuthorizeRestart`, or a
+   transition event. Normal recovery continues to use the stateful wrapper.
 2. Follow `nextAction`. For `REPLACE_LEGACY_BRIDGE_ONCE`, require authenticated
    `/admin/info` success, probe HTTP 404, local process capability `CAPABLE`,
    unhealthy Tunnel, an unchanged session snapshot, and no prior Bridge replacement.
@@ -158,16 +191,35 @@ The structured helper may instead return `BLOCKED_LOCAL_EXECUTION`,
    the requested MCP URL against the doctor endpoint before changing session
    or endpoint metadata, then records
    `CONNECTOR_CONFIRMED` and returns `POST_RECOVERY_VERIFY`.
-6. Resume automatically. Use the built-in IAB and the saved session Chat URL.
-   Call `workspace_info` through the confirmed Connector; require workspace
-   name and id to match local `workspace --json`. Send a unique, read-only
-   `[C2C CHECK]` to that same URL and automatically verify its CHECK_ID and
-   workspace fields. Require URL, Project URL, workflow mode, checkpoint,
-   task id, iteration, and last state to remain unchanged. Pass the observed
-   values to `c2c-status.ps1 -Phase POST_RECOVERY_VERIFY -ConnectorConfirmed`
-   (`-WorkspaceInfoName`, `-WorkspaceInfoId`, `-SavedChatUrlAfter`, `-CheckId`,
-   and `-ReplyCheckId`). Require the returned state to be `COMPLETE`. Do not
+6. Resume automatically using the official Browser Runtime contract above. Get the current session IAB and list its tabs before choosing a tab.
+
+   A Node REPL reset or stale handle within the same Codex session must reacquire that session IAB and its existing exact-URL tab. This recovery path MUST NOT call tabs.new(). A newly started Codex session may receive a new IAB with an empty tab list; that state means Browser Runtime PASS and TAB_INITIALIZATION_REQUIRED, not IAB_CONTROL_UNAVAILABLE.
+
+   Resolve expectedChatUrl first: long-chat uses authoritative session.url; Project mode requires an explicit URL for this Codex conversation or a URL previously verified for this conversation. Workspace-level session.url alone is not authoritative. Without a proven Project thread URL, report THREAD_BINDING_UNKNOWN and stop before goto or send.
+
+   If an exact-URL tab exists, bind it with `tabs.get(id)`. If no exact match exists but exactly one reusable ChatGPT tab exists, bind it with `tabs.get(id)`, reuse it, and navigate it to expectedChatUrl. If this is a fresh Codex session and tabs.list() is empty, create exactly one tab with tab = await iab.tabs.new(), then await tab.goto(expectedChatUrl). Verify await tab.url() == expectedChatUrl and verify a present, enabled composer. If multiple non-matching tabs make selection ambiguous, stop without creating a tab.
+
+   tabs.new() creates a browser tab in this Codex session; it does not create a ChatGPT conversation. Navigating to the authoritative expectedChatUrl reopens the existing conversation. A new ChatGPT conversation is created through the Project collection New chat composer. Report a browser/tab control failure only if tabs.new(), navigation, actual-URL verification, or composer observation fails; preserve the exact failed stage.
+
+
+   Before sending the read-only CHECK, require the expected URL, the controlled
+   tab's exact actual URL, and a present, enabled composer. Check that the
+   unique CHECK_ID is absent. After a send timeout or reset, report
+   SIDE_EFFECT_UNKNOWN, re-bootstrap the official client, reacquire the same
+   IAB and exact-URL tab, and inspect for the exact CHECK_ID. If present, treat
+   it as committed and do not resend. If absent only after the conversation is
+   fully loaded, at most one controlled retry is allowed; if uncertain, stop.
+
+Call workspace_info through the confirmed Connector; require workspace
+   name and id to match local workspace --json. Send a unique, read-only
+   [C2C CHECK] to that same URL and automatically verify its CHECK_ID and
+   workspace fields. Require URL, Project URL, workflow mode, checkpoint, task
+   id, iteration, and last state to remain unchanged. Pass the observed values
+   to c2c-status.ps1 -Phase POST_RECOVERY_VERIFY -ConnectorConfirmed
+   (-WorkspaceInfoName, -WorkspaceInfoId, -SavedChatUrlAfter, -CheckId,
+   and -ReplyCheckId). Require the returned state to be COMPLETE. Do not
    send INIT, PLAN, EXECUTED, or REVIEW.
+
 7. Return `COMPLETE` only when local health, endpoint/Connector confirmation,
    workspace identity, saved-Chat round trip, and session integrity all pass.
    Do not modify Project settings.
